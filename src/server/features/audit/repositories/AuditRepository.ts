@@ -1,39 +1,64 @@
 /**
  * Data access layer for site audit tables.
- * All D1 interactions for audits, audit_pages, and audit_psi_results.
+ * Provider-aware (D1 or Postgres) via the `@/db` handle. Covers audits,
+ * audit_pages, audit_issues, and stored Lighthouse results. Link edges live
+ * in the per-audit scratchpad Durable Object, not here.
  */
+import { and, count, desc, eq } from "drizzle-orm";
 import { db } from "@/db";
-import { audits, auditPages, auditPsiResults, projects } from "@/db/schema";
-import { and, desc, eq } from "drizzle-orm";
-import type { PsiResult, AuditConfig } from "@/server/lib/audit/types";
-
-// ─── Create ──────────────────────────────────────────────────────────────────
+import {
+  audits,
+  auditIssues,
+  auditLighthouseResults,
+  auditPages,
+  projects,
+} from "@/db/schema";
+import { executeInBatches } from "@/db/runBatch";
+import { insertIssues } from "./auditIssueWrites";
+import { deterministicAuditRowId } from "@/server/lib/audit/ids";
+import type { DetectedIssue } from "@/server/lib/audit/issues/page-reporters";
+import type {
+  AuditConfig,
+  CrawledPageResult,
+  LighthouseResult,
+} from "@/server/lib/audit/types";
+import type { PageFetchClass } from "@/shared/audit-fetch-class";
 
 async function createAudit(data: {
   id: string;
   projectId: string;
-  userId: string;
+  startedByUserId: string;
   startUrl: string;
   workflowInstanceId: string;
   config: AuditConfig;
   pagesTotal: number;
-  psiTotal: number;
+  lighthouseTotal: number;
 }) {
   await db.insert(audits).values({
     id: data.id,
     projectId: data.projectId,
-    userId: data.userId,
+    startedByUserId: data.startedByUserId,
     startUrl: data.startUrl,
     workflowInstanceId: data.workflowInstanceId,
     config: JSON.stringify(data.config),
     status: "running",
     pagesTotal: data.pagesTotal,
-    psiTotal: data.psiTotal,
+    lighthouseTotal: data.lighthouseTotal,
     currentPhase: "discovery",
   });
 }
 
-// ─── Update ──────────────────────────────────────────────────────────────────
+/** Records where the crawl really starts, once the workflow has probed the site. */
+async function updateAuditStart(
+  auditId: string,
+  startUrl: string,
+  config: AuditConfig,
+) {
+  await db
+    .update(audits)
+    .set({ startUrl, config: JSON.stringify(config) })
+    .where(eq(audits.id, auditId));
+}
 
 async function updateAuditProgress(
   auditId: string,
@@ -41,9 +66,9 @@ async function updateAuditProgress(
   data: {
     pagesCrawled?: number;
     pagesTotal?: number;
-    psiTotal?: number;
-    psiCompleted?: number;
-    psiFailed?: number;
+    lighthouseTotal?: number;
+    lighthouseCompleted?: number;
+    lighthouseFailed?: number;
     currentPhase?: string;
   },
 ) {
@@ -82,18 +107,35 @@ async function completeAudit(
     );
 }
 
-async function failAudit(auditId: string, workflowInstanceId: string) {
+async function failAudit(
+  auditId: string,
+  workflowInstanceId: string,
+  errorInfo?: {
+    errorCode: string;
+    errorDetail: string;
+    failedPhase: string | null;
+  },
+) {
+  // Only a running audit can transition to failed: the getStatus reconciler
+  // races the workflow's own finalize, and without this guard it could flip
+  // a just-completed audit to failed.
   await db
     .update(audits)
     .set({
       status: "failed",
       completedAt: new Date().toISOString(),
       currentPhase: "failed",
+      ...(errorInfo && {
+        errorCode: errorInfo.errorCode,
+        errorDetail: errorInfo.errorDetail,
+        failedPhase: errorInfo.failedPhase,
+      }),
     })
     .where(
       and(
         eq(audits.id, auditId),
         eq(audits.workflowInstanceId, workflowInstanceId),
+        eq(audits.status, "running"),
       ),
     );
 }
@@ -110,250 +152,290 @@ async function getAuditForWorkflow(
   });
 }
 
-// ─── Batch write results (finalize step) ─────────────────────────────────────
-
 /**
- * Use db.batch() to send individual INSERT statements in a single round-trip.
- * D1's batch API supports up to 100 *statements* per call — each statement
- * has its own bind params, so there's no per-statement param limit issue.
+ * Persist one crawled sub-batch (pages + per-page issues). Called inside the
+ * crawl-chunk Workflow step so results land in the app DB incrementally
+ * instead of accumulating in memory until finalize. Link edges go to the
+ * audit's scratchpad DO, not here.
+ *
+ * Idempotent on step retry: callers assign deterministic page ids
+ * (deterministicAuditRowId) and issue ids are derived from stable content.
+ * Page rows upsert (a retried fetch may legitimately differ — last attempt
+ * wins); issues are insert-or-ignore.
  */
-async function batchWriteResults(
+async function insertCrawledBatch(
   auditId: string,
-  pages: Array<{
-    id: string;
-    url: string;
-    statusCode: number;
-    redirectUrl: string | null;
-    title: string;
-    metaDescription: string;
-    canonicalUrl: string | null;
-    robotsMeta: string | null;
-    ogTitle: string | null;
-    ogDescription: string | null;
-    ogImage: string | null;
-    h1Count: number;
-    h2Count: number;
-    h3Count: number;
-    h4Count: number;
-    h5Count: number;
-    h6Count: number;
-    headingOrder: number[];
-    wordCount: number;
-    imagesTotal: number;
-    imagesMissingAlt: number;
-    images: Array<{ src: string | null; alt: string | null }>;
-    internalLinks: string[];
-    externalLinks: string[];
-    hasStructuredData: boolean;
-    hreflangTags: string[];
-    isIndexable: boolean;
-    responseTimeMs: number;
-  }>,
-  psiResults: PsiResult[],
+  pages: CrawledPageResult[],
+  issues: DetectedIssue[],
 ) {
-  const BATCH_SIZE = 100; // D1 max statements per batch() call
+  await executeInBatches(pages, (tx, page) => {
+    const dataColumns = {
+      url: page.url,
+      statusCode: page.statusCode,
+      redirectUrl: page.redirectUrl,
+      title: page.title,
+      metaDescription: page.metaDescription,
+      canonicalUrl: page.canonicalUrl,
+      robotsMeta: page.robotsMeta,
+      xRobotsTag: page.xRobotsTag,
+      headerCanonicalUrl: page.headerCanonicalUrl,
+      ogTitle: page.ogTitle,
+      ogDescription: page.ogDescription,
+      ogImage: page.ogImage,
+      h1Count: page.h1Count,
+      h2Count: page.h2Count,
+      h3Count: page.h3Count,
+      h4Count: page.h4Count,
+      h5Count: page.h5Count,
+      h6Count: page.h6Count,
+      wordCount: page.wordCount,
+      contentHash: page.contentHash,
+      imagesTotal: page.imagesTotal,
+      imagesMissingAlt: page.imagesMissingAlt,
+      internalLinkCount: page.links.filter((l) => l.isInternal).length,
+      externalLinkCount: page.links.filter((l) => !l.isInternal).length,
+      hasStructuredData: page.hasStructuredData,
+      isIndexable: page.isIndexable,
+      fetchClass: page.fetchClass,
+      crawlDepth: page.crawlDepth,
+      inSitemap: page.inSitemap,
+      responseTimeMs: page.responseTimeMs,
+    };
+    return tx
+      .insert(auditPages)
+      .values({ id: page.id, auditId, ...dataColumns })
+      .onConflictDoUpdate({ target: auditPages.id, set: dataColumns });
+  });
 
-  // ── Pages ──────────────────────────────────────────────────────────
-  const pageStatements = pages.map((p) =>
-    db.insert(auditPages).values({
-      id: p.id,
-      auditId,
-      url: p.url,
-      statusCode: p.statusCode,
-      redirectUrl: p.redirectUrl,
-      // Metadata
-      title: p.title,
-      metaDescription: p.metaDescription,
-      canonicalUrl: p.canonicalUrl,
-      robotsMeta: p.robotsMeta,
-      // Open Graph
-      ogTitle: p.ogTitle,
-      ogDescription: p.ogDescription,
-      ogImage: p.ogImage,
-      // Headings
-      h1Count: p.h1Count,
-      h2Count: p.h2Count,
-      h3Count: p.h3Count,
-      h4Count: p.h4Count,
-      h5Count: p.h5Count,
-      h6Count: p.h6Count,
-      headingOrderJson: JSON.stringify(p.headingOrder),
-      // Content
-      wordCount: p.wordCount,
-      // Images
-      imagesTotal: p.imagesTotal,
-      imagesMissingAlt: p.imagesMissingAlt,
-      imagesJson: JSON.stringify(p.images),
-      // Links
-      internalLinkCount: p.internalLinks.length,
-      externalLinkCount: p.externalLinks.length,
-      // Structured data
-      hasStructuredData: p.hasStructuredData,
-      // Hreflang
-      hreflangTagsJson: JSON.stringify(p.hreflangTags),
-      // Indexability
-      isIndexable: p.isIndexable,
-      // Performance
-      responseTimeMs: p.responseTimeMs,
-    }),
-  );
+  await insertIssues(auditId, issues);
+}
 
-  for (let i = 0; i < pageStatements.length; i += BATCH_SIZE) {
-    const chunk = pageStatements.slice(i, i + BATCH_SIZE);
-    const [first, ...rest] = chunk;
-    await db.batch([first, ...rest]);
-  }
-
-  // ── PSI results ────────────────────────────────────────────────────
-  if (psiResults.length > 0) {
-    const psiStatements = psiResults.map((r) =>
-      db.insert(auditPsiResults).values({
-        id: crypto.randomUUID(),
+async function insertLighthouseResults(
+  auditId: string,
+  lighthouseResults: LighthouseResult[],
+) {
+  const rows = await Promise.all(
+    lighthouseResults.map(async (result) => ({
+      id: await deterministicAuditRowId(
         auditId,
-        pageId: r.pageId,
-        strategy: r.strategy,
-        performanceScore: r.performanceScore,
-        accessibilityScore: r.accessibilityScore,
-        bestPracticesScore: r.bestPracticesScore,
-        seoScore: r.seoScore,
-        lcpMs: r.lcpMs,
-        cls: r.cls,
-        inpMs: r.inpMs,
-        ttfbMs: r.ttfbMs,
-        errorMessage: r.errorMessage ?? null,
-        r2Key: r.r2Key ?? null,
-        payloadSizeBytes: r.payloadSizeBytes ?? null,
-      }),
-    );
-
-    for (let i = 0; i < psiStatements.length; i += BATCH_SIZE) {
-      const chunk = psiStatements.slice(i, i + BATCH_SIZE);
-      const [first, ...rest] = chunk;
-      await db.batch([first, ...rest]);
-    }
-  }
-}
-
-// ─── Read ────────────────────────────────────────────────────────────────────
-
-async function isProjectOwnedByUser(projectId: string, userId: string) {
-  const project = await db.query.projects.findFirst({
-    where: and(eq(projects.id, projectId), eq(projects.userId, userId)),
+        result.pageId,
+        result.strategy,
+      ),
+      auditId,
+      pageId: result.pageId,
+      strategy: result.strategy,
+      performanceScore: result.performanceScore,
+      accessibilityScore: result.accessibilityScore,
+      bestPracticesScore: result.bestPracticesScore,
+      seoScore: result.seoScore,
+      lcpMs: result.lcpMs,
+      cls: result.cls,
+      inpMs: result.inpMs,
+      ttfbMs: result.ttfbMs,
+      errorMessage: result.errorMessage ?? null,
+      r2Key: result.r2Key ?? null,
+      payloadSizeBytes: result.payloadSizeBytes ?? null,
+    })),
+  );
+  // The persistence step is retryable after its paid provider result has been
+  // checkpointed, so repeated writes must stay idempotent.
+  await executeInBatches(rows, (tx, row) => {
+    const { id: _id, auditId: _auditId, ...dataColumns } = row;
+    return tx.insert(auditLighthouseResults).values(row).onConflictDoUpdate({
+      target: auditLighthouseResults.id,
+      set: dataColumns,
+    });
   });
-  return Boolean(project);
 }
 
-async function getAuditForUser(auditId: string, userId: string) {
+async function getAuditForProject(auditId: string, projectId: string) {
   return db.query.audits.findFirst({
-    where: and(eq(audits.id, auditId), eq(audits.userId, userId)),
+    where: and(eq(audits.id, auditId), eq(audits.projectId, projectId)),
   });
 }
 
-async function getAuditsByProjectForUser(projectId: string, userId: string) {
-  return db.query.audits.findMany({
-    where: and(eq(audits.projectId, projectId), eq(audits.userId, userId)),
-    orderBy: [desc(audits.startedAt)],
+async function getLatestAuditForProject(projectId: string) {
+  return db.query.audits.findFirst({
+    where: eq(audits.projectId, projectId),
+    orderBy: desc(audits.startedAt),
   });
 }
 
-async function getAuditCapacityUsageForUser(userId: string) {
-  const rows = await db.query.audits.findMany({
-    where: eq(audits.userId, userId),
-    columns: {
-      pagesTotal: true,
-      psiTotal: true,
-    },
+async function getIssuesForAudit(
+  auditId: string,
+  filters: { severity?: "critical" | "warning" | "info"; issueType?: string },
+) {
+  return db.query.auditIssues.findMany({
+    where: and(
+      eq(auditIssues.auditId, auditId),
+      filters.severity ? eq(auditIssues.severity, filters.severity) : undefined,
+      filters.issueType
+        ? eq(auditIssues.issueType, filters.issueType)
+        : undefined,
+    ),
   });
-
-  return rows.reduce((total, row) => total + row.pagesTotal + row.psiTotal, 0);
 }
 
-async function getAuditResultsForUser(auditId: string, userId: string) {
-  const audit = await getAuditForUser(auditId, userId);
+async function getPagesForAudit(auditId: string) {
+  return db
+    .select({
+      id: auditPages.id,
+      url: auditPages.url,
+      statusCode: auditPages.statusCode,
+      fetchClass: auditPages.fetchClass,
+      redirectUrl: auditPages.redirectUrl,
+      title: auditPages.title,
+      metaDescription: auditPages.metaDescription,
+      wordCount: auditPages.wordCount,
+      isIndexable: auditPages.isIndexable,
+      crawlDepth: auditPages.crawlDepth,
+      inSitemap: auditPages.inSitemap,
+      internalLinkCount: auditPages.internalLinkCount,
+      responseTimeMs: auditPages.responseTimeMs,
+    })
+    .from(auditPages)
+    .where(eq(auditPages.auditId, auditId));
+}
+
+async function countPagesByFetchClass(
+  auditId: string,
+  fetchClass: PageFetchClass,
+): Promise<number> {
+  const rows = await db
+    .select({ pages: count() })
+    .from(auditPages)
+    .where(
+      and(
+        eq(auditPages.auditId, auditId),
+        eq(auditPages.fetchClass, fetchClass),
+      ),
+    );
+  return rows[0]?.pages ?? 0;
+}
+
+async function hasPagesForAudit(auditId: string): Promise<boolean> {
+  const rows = await db
+    .select({ id: auditPages.id })
+    .from(auditPages)
+    .where(eq(auditPages.auditId, auditId))
+    .limit(1);
+  return rows.length > 0;
+}
+
+async function getAuditsByProject(projectId: string) {
+  const rows = await db
+    .select({ audit: audits })
+    .from(audits)
+    .where(eq(audits.projectId, projectId))
+    .orderBy(desc(audits.startedAt));
+
+  return rows.map(({ audit }) => audit);
+}
+
+// Org-scoped: the free-plan quota belongs to the org (the Autumn customer),
+// so usage must aggregate across every member — counting per starting user
+// would multiply the free ceiling by the member count.
+async function getAuditUsageForOrganization(organizationId: string) {
+  const rows = await db
+    .select({
+      status: audits.status,
+      pagesTotal: audits.pagesTotal,
+      lighthouseTotal: audits.lighthouseTotal,
+    })
+    .from(audits)
+    .innerJoin(projects, eq(audits.projectId, projects.id))
+    .where(eq(projects.organizationId, organizationId));
+
+  return {
+    capacityUnits: rows.reduce(
+      (total, row) => total + row.pagesTotal + row.lighthouseTotal,
+      0,
+    ),
+    runningCount: rows.filter((row) => row.status === "running").length,
+  };
+}
+
+async function getAuditResultsForProject(auditId: string, projectId: string) {
+  const audit = await getAuditForProject(auditId, projectId);
   if (!audit) {
-    return { audit: null, pages: [], psi: [] };
+    return { audit: null, pages: [], lighthouse: [], issues: [] };
   }
 
-  const [pages, psi] = await Promise.all([
+  const [pages, lighthouse, issues] = await Promise.all([
     db.query.auditPages.findMany({
       where: eq(auditPages.auditId, auditId),
     }),
-    db.query.auditPsiResults.findMany({
-      where: eq(auditPsiResults.auditId, auditId),
+    db.query.auditLighthouseResults.findMany({
+      where: eq(auditLighthouseResults.auditId, auditId),
+    }),
+    db.query.auditIssues.findMany({
+      where: eq(auditIssues.auditId, auditId),
     }),
   ]);
 
-  return { audit, pages, psi };
+  return { audit, pages, lighthouse, issues };
 }
 
-async function getPsiResultById(input: {
-  psiResultId: string;
+async function getLighthouseResultById(input: {
+  lighthouseResultId: string;
   projectId: string;
-  userId: string;
 }) {
-  const project = await db.query.projects.findFirst({
-    where: and(
-      eq(projects.id, input.projectId),
-      eq(projects.userId, input.userId),
-    ),
+  const lighthouse = await db.query.auditLighthouseResults.findFirst({
+    where: eq(auditLighthouseResults.id, input.lighthouseResultId),
   });
 
-  if (!project) {
-    throw new Error("Project not found");
+  if (!lighthouse) {
+    return null;
   }
 
-  const psi = await db.query.auditPsiResults.findFirst({
-    where: eq(auditPsiResults.id, input.psiResultId),
-  });
-
-  if (!psi) return null;
-
-  const parentAudit = await db.query.audits.findFirst({
-    where: and(
-      eq(audits.id, psi.auditId),
-      eq(audits.projectId, input.projectId),
-      eq(audits.userId, input.userId),
-    ),
-  });
+  const [parentAudit, page] = await Promise.all([
+    db.query.audits.findFirst({
+      where: and(
+        eq(audits.id, lighthouse.auditId),
+        eq(audits.projectId, input.projectId),
+      ),
+    }),
+    db.query.auditPages.findFirst({
+      where: eq(auditPages.id, lighthouse.pageId),
+    }),
+  ]);
 
   if (!parentAudit) {
-    throw new Error("Audit not found");
+    return null;
   }
 
-  const page = await db.query.auditPages.findFirst({
-    where: eq(auditPages.id, psi.pageId),
-  });
-
   return {
-    psi,
+    lighthouse,
     page,
     audit: parentAudit,
   };
 }
 
-// ─── Delete ──────────────────────────────────────────────────────────────────
-
-async function deleteAuditForUser(auditId: string, userId: string) {
-  // Cascading deletes handle child tables
+async function deleteAuditForProject(auditId: string, projectId: string) {
   await db
     .delete(audits)
-    .where(and(eq(audits.id, auditId), eq(audits.userId, userId)));
+    .where(and(eq(audits.id, auditId), eq(audits.projectId, projectId)));
 }
-
-// ─── Export ──────────────────────────────────────────────────────────────────
 
 export const AuditRepository = {
   createAudit,
+  updateAuditStart,
   updateAuditProgress,
   completeAudit,
   failAudit,
   getAuditForWorkflow,
-  batchWriteResults,
-  isProjectOwnedByUser,
-  getAuditForUser,
-  getAuditsByProjectForUser,
-  getAuditCapacityUsageForUser,
-  getAuditResultsForUser,
-  getPsiResultById,
-  deleteAuditForUser,
+  insertCrawledBatch,
+  insertIssues,
+  insertLighthouseResults,
+  getAuditForProject,
+  getLatestAuditForProject,
+  getIssuesForAudit,
+  getPagesForAudit,
+  countPagesByFetchClass,
+  hasPagesForAudit,
+  getAuditsByProject,
+  getAuditUsageForOrganization,
+  getAuditResultsForProject,
+  getLighthouseResultById,
+  deleteAuditForProject,
 } as const;

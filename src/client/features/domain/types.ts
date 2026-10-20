@@ -1,3 +1,5 @@
+import type { ResearchScope } from "@/shared/researchScope";
+
 export type KeywordRow = {
   keyword: string;
   position: number | null;
@@ -16,32 +18,52 @@ export type PageRow = {
   keywords: number | null;
 };
 
+export type DomainFilterValues = {
+  include: string;
+  exclude: string;
+  minTraffic: string;
+  maxTraffic: string;
+  minVol: string;
+  maxVol: string;
+  minCpc: string;
+  maxCpc: string;
+  minKd: string;
+  maxKd: string;
+  minRank: string;
+  maxRank: string;
+};
+
+export const EMPTY_DOMAIN_FILTERS: DomainFilterValues = {
+  include: "",
+  exclude: "",
+  minTraffic: "",
+  maxTraffic: "",
+  minVol: "",
+  maxVol: "",
+  minCpc: "",
+  maxCpc: "",
+  minKd: "",
+  maxKd: "",
+  minRank: "",
+  maxRank: "",
+};
+
+export type KeywordsFilterValues = DomainFilterValues;
+
+export type PagesFilterValues = Pick<
+  DomainFilterValues,
+  "include" | "exclude" | "minTraffic" | "maxTraffic" | "minVol" | "maxVol"
+>;
+
+export type PageFilterKey = keyof PagesFilterValues;
+
 export type DomainControlsValues = {
   domain: string;
-  subdomains: boolean;
-  sort: "rank" | "traffic" | "volume";
+  scope: ResearchScope;
+  sort: "rank" | "traffic" | "volume" | "score" | "cpc";
+  locationCode: number;
 };
 
 export type DomainSortMode = DomainControlsValues["sort"];
 export type SortOrder = "asc" | "desc";
 export type DomainActiveTab = "keywords" | "pages";
-
-export type DomainOverviewData = {
-  domain: string;
-  organicTraffic: number | null;
-  organicKeywords: number | null;
-  backlinks: number | null;
-  referringDomains: number | null;
-  hasData: boolean;
-  keywords: KeywordRow[];
-  pages: PageRow[];
-};
-
-export type DomainHistoryItem = {
-  timestamp: number;
-  domain: string;
-  subdomains: boolean;
-  sort: DomainSortMode;
-  tab: DomainActiveTab;
-  search?: string;
-};

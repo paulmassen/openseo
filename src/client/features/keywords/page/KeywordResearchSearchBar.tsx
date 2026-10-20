@@ -1,110 +1,150 @@
-import { Search } from "lucide-react";
+import { Info, Search } from "lucide-react";
+import { getFieldError } from "@/client/lib/forms";
+import { MAX_KEYWORDS_PER_SUBMIT } from "@/client/features/keywords/keywordResearchTypes";
+import { isLabsLocationCode } from "@/client/features/keywords/locations";
+import { LocationSelect } from "@/client/components/LocationSelect";
+import { Alert, AlertDescription } from "@/client/components/ui/alert";
+import { Button } from "@/client/components/ui/button";
+import { Card, CardContent } from "@/client/components/ui/card";
 import {
-  isResultLimit,
-  normalizeKeywordMode,
-} from "@/client/features/keywords/keywordSearchParams";
-import { RESULT_LIMITS } from "@/client/features/keywords/keywordResearchTypes";
-import { LOCATION_OPTIONS } from "@/client/features/keywords/locations";
+  InputGroup,
+  InputGroupAddon,
+  InputGroupTextarea,
+} from "@/client/components/ui/input-group";
+import { KeywordAreaField, LocalVolumeCostNote } from "./KeywordAreaField";
+import { KeywordSearchOptions } from "./KeywordSearchOptions";
 import type { KeywordResearchControllerState } from "./types";
 
 type Props = {
   controller: KeywordResearchControllerState;
 };
 
+function getTextareaRows(value: string): number {
+  const newlines = (value.match(/\n/g) ?? []).length;
+  const lines = newlines + 1;
+  return Math.min(MAX_KEYWORDS_PER_SUBMIT, Math.max(1, lines));
+}
+
 export function KeywordResearchSearchBar({ controller }: Props) {
-  const { controlsForm, handleSearchSubmit, isLoading, searchInputError } =
-    controller;
+  const { controlsForm, handleSearchSubmit } = controller;
 
   return (
-    <div className="shrink-0 px-4 md:px-6 pt-4 pb-2 max-w-8xl mx-auto w-full">
-      <form
-        className="bg-base-100 border border-base-300 rounded-xl px-4 py-3 flex flex-wrap items-center gap-2"
-        onSubmit={handleSearchSubmit}
-      >
-        <label
-          className={`input input-bordered input-sm flex items-center gap-2 flex-1 min-w-0 max-w-md ${searchInputError ? "input-error" : ""}`}
+    // The city field opens an absolute menu below the row, so the card must
+    // not clip it.
+    <Card className="overflow-visible">
+      <CardContent className="space-y-2">
+        <form
+          noValidate
+          className="flex flex-col gap-3 lg:flex-row lg:flex-wrap lg:items-start"
+          onSubmit={handleSearchSubmit}
         >
-          <Search className="size-3.5 shrink-0 text-base-content/50" />
           <controlsForm.Field name="keyword">
-            {(field) => (
-              <input
-                className="grow min-w-0"
-                placeholder="Enter Keyword"
-                value={field.state.value}
-                onChange={(event) => {
-                  field.handleChange(event.target.value);
-                  if (searchInputError) controller.setSearchInputError(null);
-                }}
-              />
-            )}
+            {(field) => {
+              const keywordError = getFieldError(field.state.meta.errors);
+              const rows = getTextareaRows(field.state.value);
+
+              return (
+                // Extra lines grow the field.
+                <InputGroup className="min-h-10 w-full lg:max-w-md lg:min-w-0 lg:flex-1">
+                  <InputGroupAddon
+                    className={rows > 1 ? "self-start pt-3" : undefined}
+                  >
+                    <Search />
+                  </InputGroupAddon>
+                  <InputGroupTextarea
+                    className="min-h-0 py-[7px] leading-6 field-sizing-fixed"
+                    rows={rows}
+                    placeholder="Enter a keyword"
+                    aria-label="Keywords"
+                    aria-invalid={keywordError ? true : undefined}
+                    value={field.state.value}
+                    onChange={(event) => field.handleChange(event.target.value)}
+                    onKeyDown={(event) => {
+                      // Enter submits. Shift+Enter inserts a newline, so
+                      // researching several keywords at once means adding a
+                      // line per keyword (or pasting newline-separated ones).
+                      if (event.key === "Enter" && !event.shiftKey) {
+                        event.preventDefault();
+                        void controlsForm.handleSubmit();
+                      }
+                    }}
+                  />
+                </InputGroup>
+              );
+            }}
           </controlsForm.Field>
-        </label>
 
-        <controlsForm.Field name="locationCode">
-          {(field) => (
-            <select
-              className="select select-bordered select-sm w-auto"
-              value={field.state.value}
-              onChange={(event) =>
-                field.handleChange(Number(event.target.value))
-              }
+          <div className="grid grid-cols-2 gap-2 lg:contents">
+            <controlsForm.Field name="locationCode">
+              {(field) => (
+                <LocationSelect
+                  value={field.state.value}
+                  onChange={(code) => {
+                    field.handleChange(code);
+                    // An area belongs to one country.
+                    controlsForm.setFieldValue("locationName", undefined);
+                  }}
+                  className="col-span-2 w-full lg:w-44 lg:shrink-0"
+                />
+              )}
+            </controlsForm.Field>
+
+            <controlsForm.Subscribe
+              selector={(state) => state.values.locationCode}
             >
-              {LOCATION_OPTIONS.map((option) => (
-                <option key={option.code} value={option.code}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          )}
-        </controlsForm.Field>
+              {(locationCode) => (
+                <controlsForm.Field name="locationName">
+                  {(field) => (
+                    <KeywordAreaField
+                      locationCode={locationCode}
+                      value={field.state.value}
+                      onChange={(name) => field.handleChange(name)}
+                    />
+                  )}
+                </controlsForm.Field>
+              )}
+            </controlsForm.Subscribe>
 
-        <controlsForm.Field name="resultLimit">
-          {(field) => (
-            <select
-              className="select select-bordered select-sm w-auto"
-              value={field.state.value}
-              onChange={(event) => {
-                const next = Number(event.target.value);
-                field.handleChange(isResultLimit(next) ? next : 150);
-              }}
-            >
-              {RESULT_LIMITS.map((limit) => (
-                <option key={limit} value={limit}>
-                  {limit} results
-                </option>
-              ))}
-            </select>
-          )}
-        </controlsForm.Field>
+            <KeywordSearchOptions controller={controller} />
 
-        <controlsForm.Field name="mode">
-          {(field) => (
-            <select
-              className="select select-bordered select-sm w-auto"
-              value={field.state.value}
-              onChange={(event) =>
-                field.handleChange(normalizeKeywordMode(event.target.value))
-              }
-            >
-              <option value="auto">Auto</option>
-              <option value="related">Related keywords</option>
-              <option value="suggestions">Suggestions</option>
-              <option value="ideas">Ideas</option>
-            </select>
-          )}
-        </controlsForm.Field>
+            <Button type="submit" className="w-full px-6 lg:w-auto lg:shrink-0">
+              Search
+            </Button>
+          </div>
+        </form>
+        <controlsForm.Field name="keyword">
+          {(field) => {
+            const keywordError = getFieldError(field.state.meta.errors);
 
-        <button
-          type="submit"
-          className="btn btn-primary btn-sm px-6 font-semibold"
-          disabled={isLoading}
+            return keywordError ? (
+              <p role="alert" className="text-sm text-destructive">
+                {keywordError}
+              </p>
+            ) : null;
+          }}
+        </controlsForm.Field>
+        <controlsForm.Subscribe
+          selector={(state) =>
+            [state.values.locationCode, state.values.locationName] as const
+          }
         >
-          {isLoading ? "Searching..." : "Search"}
-        </button>
-      </form>
-      {searchInputError ? (
-        <p className="mt-2 text-sm text-error">{searchInputError}</p>
-      ) : null}
-    </div>
+          {([locationCode, locationName]) => (
+            <>
+              {isLabsLocationCode(locationCode) ? null : (
+                <Alert variant="info" role="status">
+                  <Info />
+                  <AlertDescription>
+                    Keyword data for this country comes from Google Ads — search
+                    volume, CPC, and trends are available, but difficulty and
+                    intent are not.
+                  </AlertDescription>
+                </Alert>
+              )}
+              {locationName ? <LocalVolumeCostNote /> : null}
+            </>
+          )}
+        </controlsForm.Subscribe>
+      </CardContent>
+    </Card>
   );
 }

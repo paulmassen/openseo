@@ -1,232 +1,149 @@
 import * as React from "react";
-import { Link, Outlet } from "@tanstack/react-router";
+import { projectsQueryOptions } from "@/client/features/projects/projectQueries";
+import { Link, useLocation } from "@tanstack/react-router";
+import { useQuery } from "@tanstack/react-query";
 import {
-  AlertTriangle,
-  ChevronsUpDown,
-  ExternalLink,
-  Menu,
-} from "lucide-react";
+  MissingSeoSetupModal,
+  SeoApiStatusBanners,
+} from "@/client/layout/AppShellParts";
+import { GscReEngagementModal } from "@/client/features/gsc/GscReEngagementModal";
 import { Sidebar } from "@/client/components/Sidebar";
-import { projectNavItems } from "@/client/navigation/items";
+import { BILLING_ROUTE } from "@/shared/billing";
+import { getSeoApiKeyStatus } from "@/serverFunctions/config";
+import { getLastProjectId } from "@/client/lib/active-project";
+import { dataforseoHelpLinkOptions } from "@/client/navigation/items";
+import {
+  SidebarInset,
+  SidebarProvider,
+  SidebarTrigger,
+} from "@/client/components/ui/sidebar";
 
-export function TopNav({
-  drawerOpen,
+export function AuthenticatedAppLayout({
+  children,
   projectId,
-  pathname,
-  onOpenDrawer,
+  ready,
+  banner,
 }: {
-  drawerOpen: boolean;
-  projectId: string | null;
-  pathname: string;
-  onOpenDrawer: () => void;
+  children: React.ReactNode;
+  projectId?: string;
+  /** The session is confirmed. Until then the shell renders but loads nothing. */
+  ready: boolean;
+  banner?: React.ReactNode;
 }) {
+  const location = useLocation();
+  const [showMissingSeoApiKeyModal, setShowMissingSeoApiKeyModal] =
+    React.useState(false);
+  // On non-project pages (e.g. /settings) there's no projectId in the URL, so
+  // derive one for the nav/switcher: prefer the last-visited project, else the
+  // most recent. The whole app tree is client-only (see root ClientOnly), so we
+  // can read localStorage synchronously during render — this lets the sidebar
+  // show the full project nav on the very first paint instead of briefly
+  // flashing only the always-visible Connect group while projects load. It is
+  // read on every render, not once: the shell stays mounted across project
+  // pages, which update the remembered project as the user moves between them.
+  const projectsQuery = useQuery({
+    ...projectsQueryOptions(),
+    enabled: ready && !projectId,
+  });
+  const rememberedProjectId = getLastProjectId();
+  const fallbackProjects = projectsQuery.data ?? [];
+  const fallbackProjectId =
+    fallbackProjects.find((project) => project.id === rememberedProjectId)
+      ?.id ??
+    fallbackProjects[0]?.id ??
+    null;
+  // Once the projects list loads, fallbackProjectId is the validated choice
+  // (remembered-if-valid, else most recent). Before it loads, fall back to the
+  // remembered id so the project nav renders immediately; a stale id here only
+  // builds links that self-correct via the route guard once data arrives.
+  const sidebarProjectId =
+    projectId ?? fallbackProjectId ?? rememberedProjectId;
+  // No project to show yet, but the list that may name one is still loading
+  // (a first visit to a page without a project in the URL).
+  const sidebarProjectPending =
+    sidebarProjectId === null && projectsQuery.isPending;
+  // The setup guide is where the modal and banners send the user, so it shows
+  // neither: a banner there would link to the page the user is already on.
+  const shouldCheckSeoApiKeyStatus =
+    location.pathname !== BILLING_ROUTE &&
+    location.pathname !== dataforseoHelpLinkOptions.to;
+  const seoApiKeyStatusQuery = useQuery({
+    queryKey: ["seoApiKeyStatus"],
+    queryFn: () => getSeoApiKeyStatus(),
+    enabled: ready && shouldCheckSeoApiKeyStatus,
+  });
+  const isSeoApiKeyConfigured = shouldCheckSeoApiKeyStatus
+    ? (seoApiKeyStatusQuery.data?.configured ?? null)
+    : null;
+  const seoApiKeyStatusError =
+    shouldCheckSeoApiKeyStatus && seoApiKeyStatusQuery.isError;
+
+  React.useEffect(() => {
+    if (!shouldCheckSeoApiKeyStatus) {
+      setShowMissingSeoApiKeyModal(false);
+      return;
+    }
+
+    if (seoApiKeyStatusQuery.isError) {
+      setShowMissingSeoApiKeyModal(false);
+      return;
+    }
+
+    if (!seoApiKeyStatusQuery.isSuccess) return;
+    setShowMissingSeoApiKeyModal(!seoApiKeyStatusQuery.data.configured);
+  }, [
+    location.pathname,
+    seoApiKeyStatusQuery.data,
+    seoApiKeyStatusQuery.isError,
+    seoApiKeyStatusQuery.isSuccess,
+    shouldCheckSeoApiKeyStatus,
+  ]);
+
+  const shouldShowSeoApiWarning =
+    !seoApiKeyStatusError &&
+    isSeoApiKeyConfigured === false &&
+    !showMissingSeoApiKeyModal;
+
   return (
-    <div className="navbar bg-base-100 border-b border-base-300 shrink-0 gap-2">
-      <div className="flex-none flex items-center md:hidden">
-        <button
-          type="button"
-          className="btn btn-square btn-ghost"
-          aria-label="Toggle sidebar"
-          aria-expanded={drawerOpen}
-          onClick={onOpenDrawer}
-        >
-          <Menu className="h-6 w-6" />
-        </button>
-        <span className="font-semibold text-base-content ml-1">OpenSEO</span>
-      </div>
+    <SidebarProvider className="h-[100dvh] min-h-0 overflow-hidden">
+      <Sidebar
+        projectId={sidebarProjectId}
+        projectPending={sidebarProjectPending}
+        ready={ready}
+      />
+      <SidebarInset className="min-h-0 overflow-hidden md:!m-0 md:!mt-2 md:!rounded-none md:!rounded-tl-lg md:border-l md:border-t md:border-sidebar-border md:!shadow-none">
+        <MobileTopBar />
+        <SeoApiStatusBanners
+          shouldShowSeoApiWarning={shouldShowSeoApiWarning}
+          seoApiKeyStatusError={seoApiKeyStatusError}
+        />
+        {banner}
+        <div className="min-h-0 flex-1 overflow-auto">{children}</div>
+      </SidebarInset>
 
-      <div className="hidden md:flex items-center gap-1">
-        <span className="text-lg font-semibold text-base-content px-2">
-          OpenSEO
-        </span>
-        {projectId
-          ? projectNavItems.map((item) => {
-              const Icon = item.icon;
-              const isActive = pathname.includes(item.matchSegment);
-              return (
-                <Link
-                  key={item.to}
-                  to={item.to}
-                  params={{ projectId }}
-                  className={`btn btn-sm gap-2 ${
-                    isActive
-                      ? "bg-primary/10 text-primary font-medium border-transparent"
-                      : "btn-ghost text-base-content/60 hover:text-base-content"
-                  }`}
-                >
-                  <Icon className="h-4 w-4" />
-                  {item.label}
-                </Link>
-              );
-            })
-          : null}
-      </div>
+      {showMissingSeoApiKeyModal ? (
+        <MissingSeoSetupModal
+          onClose={() => setShowMissingSeoApiKeyModal(false)}
+        />
+      ) : null}
 
-      <div className="flex-1" />
+      {ready ? (
+        <GscReEngagementModal
+          projectId={sidebarProjectId}
+          suppressed={showMissingSeoApiKeyModal}
+        />
+      ) : null}
+    </SidebarProvider>
+  );
+}
 
-      <div className="flex-none hidden md:flex">
-        <div
-          className="tooltip tooltip-left before:whitespace-nowrap"
-          data-tip="Multiple projects coming soon"
-        >
-          <button className="btn btn-ghost btn-sm font-medium text-sm gap-1 cursor-default">
-            <span className="truncate">Default</span>
-            <ChevronsUpDown className="size-3.5 shrink-0 text-base-content/40" />
-          </button>
-        </div>
-      </div>
+function MobileTopBar() {
+  return (
+    <div className="flex shrink-0 items-center gap-1 border-b border-border bg-card px-2 py-1.5 md:hidden">
+      <SidebarTrigger aria-label="Toggle sidebar" />
+      <Link to="/" className="ml-1 font-semibold text-foreground">
+        OpenSEO
+      </Link>
     </div>
   );
 }
-
-export function SeoApiStatusBanners({
-  helpPath,
-  shouldShowSeoApiWarning,
-  seoApiKeyStatusError,
-}: {
-  helpPath: string;
-  shouldShowSeoApiWarning: boolean;
-  seoApiKeyStatusError: boolean;
-}) {
-  return (
-    <>
-      {shouldShowSeoApiWarning ? (
-        <div className="shrink-0 px-4 py-2.5 md:px-6">
-          <div className="mx-auto max-w-7xl">
-            <div className="alert alert-warning">
-              <AlertTriangle className="size-4 shrink-0" />
-              <span className="text-sm">
-                Setup needed: add your DataForSEO API key to use OpenSEO
-                features. See the quick steps on the{" "}
-                <Link to={helpPath} className="link link-primary font-medium">
-                  help page
-                </Link>
-                .
-              </span>
-            </div>
-          </div>
-        </div>
-      ) : null}
-
-      {seoApiKeyStatusError ? (
-        <div className="shrink-0 px-4 py-2.5 md:px-6">
-          <div className="mx-auto max-w-7xl">
-            <div className="alert alert-info">
-              <AlertTriangle className="size-4 shrink-0" />
-              <span className="text-sm">
-                We could not verify your DataForSEO setup. If features are not
-                working, check the setup steps on the{" "}
-                <Link to={helpPath} className="link link-primary font-medium">
-                  help page
-                </Link>
-                .
-              </span>
-            </div>
-          </div>
-        </div>
-      ) : null}
-    </>
-  );
-}
-
-export function AppContent({
-  drawerOpen,
-  pathname,
-  projectId,
-  onCloseDrawer,
-}: {
-  drawerOpen: boolean;
-  pathname: string;
-  projectId: string | null;
-  onCloseDrawer: () => void;
-}) {
-  return (
-    <>
-      <div className="flex-1 min-h-0 md:hidden">
-        <div className="h-full overflow-auto">
-          <Outlet />
-        </div>
-
-        {drawerOpen ? (
-          <div className="fixed inset-0 z-50">
-            <button
-              type="button"
-              aria-label="Close sidebar"
-              className="absolute inset-0 bg-black/45"
-              onClick={onCloseDrawer}
-            />
-            <div className="absolute left-0 top-0 h-full">
-              <Sidebar
-                currentPath={pathname}
-                projectId={projectId}
-                onNavigate={onCloseDrawer}
-                onClose={onCloseDrawer}
-              />
-            </div>
-          </div>
-        ) : null}
-      </div>
-
-      <div className="hidden md:block flex-1 min-h-0 overflow-auto">
-        <Outlet />
-      </div>
-    </>
-  );
-}
-
-export const MissingSeoSetupModal = React.forwardRef<
-  HTMLDivElement,
-  {
-    helpPath: string;
-    isOpen: boolean;
-    onClose: () => void;
-  }
->(({ helpPath, isOpen, onClose }, ref) => {
-  if (!isOpen) return null;
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-      <div
-        ref={ref}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="dataforseo-setup-title"
-        aria-describedby="dataforseo-setup-description"
-        tabIndex={-1}
-        className="w-full max-w-lg rounded-xl border border-base-300 bg-base-100 p-5 shadow-2xl"
-      >
-        <div className="flex items-start gap-3">
-          <div className="rounded-full bg-warning/20 p-2 text-warning">
-            <AlertTriangle className="size-5" />
-          </div>
-          <div className="space-y-2">
-            <h2
-              id="dataforseo-setup-title"
-              className="text-lg font-semibold text-base-content"
-            >
-              One quick setup step
-            </h2>
-            <p
-              id="dataforseo-setup-description"
-              className="text-sm text-base-content/75"
-            >
-              Add your DataForSEO API key to start using OpenSEO.
-            </p>
-          </div>
-        </div>
-
-        <div className="mt-5 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
-          <button type="button" className="btn btn-ghost" onClick={onClose}>
-            Dismiss
-          </button>
-          <Link to={helpPath} className="btn btn-primary" onClick={onClose}>
-            Open setup guide
-            <ExternalLink className="size-4" />
-          </Link>
-        </div>
-      </div>
-    </div>
-  );
-});
-
-MissingSeoSetupModal.displayName = "MissingSeoSetupModal";

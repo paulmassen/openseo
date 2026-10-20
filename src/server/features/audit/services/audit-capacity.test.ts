@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  AUDIT_LIMITS,
   clampAuditMaxPages,
   getEstimatedAuditCapacity,
-  MAX_USER_AUDIT_USAGE,
 } from "@/server/features/audit/services/audit-capacity";
 
 describe("audit capacity helpers", () => {
@@ -13,41 +13,17 @@ describe("audit capacity helpers", () => {
     expect(clampAuditMaxPages(20_000)).toBe(10_000);
   });
 
-  it("estimates capacity for each psi strategy", () => {
-    expect(
-      getEstimatedAuditCapacity({ maxPages: 100, psiStrategy: "none" }),
-    ).toEqual({
-      pagesTotal: 100,
-      psiTotal: 0,
-      total: 100,
-    });
-    expect(
-      getEstimatedAuditCapacity({ maxPages: 100, psiStrategy: "manual" }),
-    ).toEqual({
-      pagesTotal: 100,
-      psiTotal: 0,
-      total: 100,
-    });
-    expect(
-      getEstimatedAuditCapacity({ maxPages: 100, psiStrategy: "auto" }),
-    ).toEqual({
-      pagesTotal: 100,
-      psiTotal: 20,
-      total: 120,
-    });
-    expect(
-      getEstimatedAuditCapacity({ maxPages: 100, psiStrategy: "all" }),
-    ).toEqual({
-      pagesTotal: 100,
-      psiTotal: 200,
-      total: 300,
-    });
-  });
-
-  it("stays within the global capacity limit for the maximum auto audit", () => {
-    expect(
-      getEstimatedAuditCapacity({ maxPages: 10_000, psiStrategy: "auto" })
-        .total,
-    ).toBeLessThan(MAX_USER_AUDIT_USAGE);
-  });
+  // If a tier's largest auto audit doesn't fit its own capacity budget, every
+  // max-size audit on that tier is rejected right after insert.
+  it.each(["free", "paid"] as const)(
+    "fits the maximum %s auto audit within its capacity budget",
+    (tier) => {
+      const estimate = getEstimatedAuditCapacity({
+        maxPages: AUDIT_LIMITS[tier].maxPagesPerAudit,
+        lighthouseStrategy: "auto",
+      });
+      expect(estimate.pagesTotal).toBe(AUDIT_LIMITS[tier].maxPagesPerAudit);
+      expect(estimate.total).toBeLessThan(AUDIT_LIMITS[tier].maxCapacityUnits);
+    },
+  );
 });

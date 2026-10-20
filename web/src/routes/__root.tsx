@@ -7,6 +7,7 @@ import {
 import * as React from "react";
 import appCss from "@/styles/app.css?url";
 import { RootProvider } from "fumadocs-ui/provider/tanstack";
+import { PrivacyChoices } from "@/components/privacy-choices";
 
 export const Route = createRootRoute({
   head: () => ({
@@ -22,6 +23,24 @@ export const Route = createRootRoute({
     links: [
       { rel: "stylesheet", href: appCss },
       { rel: "icon", type: "image/x-icon", href: "/favicon.ico" },
+      {
+        rel: "apple-touch-icon",
+        sizes: "180x180",
+        href: "/apple-touch-icon.png",
+      },
+      {
+        rel: "icon",
+        type: "image/png",
+        sizes: "32x32",
+        href: "/favicon-32x32.png",
+      },
+      {
+        rel: "icon",
+        type: "image/png",
+        sizes: "16x16",
+        href: "/favicon-16x16.png",
+      },
+      { rel: "manifest", href: "/site.webmanifest" },
     ],
   }),
   component: RootComponent,
@@ -40,6 +59,8 @@ function RootDocument({ children }: { children: React.ReactNode }) {
     <html lang="en" suppressHydrationWarning>
       <head>
         <HeadContent />
+        {/* Plausible counts visits without cookies, so it runs for everyone.
+            Deferred to idle so it never competes with the page's own work. */}
         <script
           dangerouslySetInnerHTML={{
             __html:
@@ -48,7 +69,8 @@ function RootDocument({ children }: { children: React.ReactNode }) {
         />
       </head>
       <body className="flex flex-col min-h-screen bg-fd-background text-fd-foreground">
-        <RootProvider>{children}</RootProvider>
+        <RootProvider search={{ enabled: false }}>{children}</RootProvider>
+        <PrivacyChoices />
         <Scripts />
       </body>
     </html>

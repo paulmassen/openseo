@@ -4,10 +4,16 @@ import type {
   PageRow,
   SortOrder,
 } from "@/client/features/domain/types";
-import { buildCsv, downloadCsv as downloadCsvFile } from "@/client/lib/csv";
+import { parseResearchTarget } from "@/shared/researchScope";
 
 export function toSortMode(value: string | null): DomainSortMode | undefined {
-  if (value === "rank" || value === "traffic" || value === "volume") {
+  if (
+    value === "rank" ||
+    value === "traffic" ||
+    value === "volume" ||
+    value === "score" ||
+    value === "cpc"
+  ) {
     return value;
   }
   return undefined;
@@ -32,7 +38,7 @@ export function resolveSortOrder(
 export function toSortSearchParam(
   sortMode: DomainSortMode,
 ): DomainSortMode | undefined {
-  return sortMode === "rank" ? undefined : sortMode;
+  return sortMode === "traffic" ? undefined : sortMode;
 }
 
 export function toSortOrderSearchParam(
@@ -42,40 +48,17 @@ export function toSortOrderSearchParam(
   return sortOrder === getDefaultSortOrder(sortMode) ? undefined : sortOrder;
 }
 
-export function sortableNullableNumber(
-  value: number | null | undefined,
-  order: SortOrder,
-): number {
-  if (value != null) return value;
-  return order === "asc" ? Number.POSITIVE_INFINITY : Number.NEGATIVE_INFINITY;
-}
-
 export function toPageSortMode(
   sortMode: DomainSortMode,
-): Exclude<DomainSortMode, "rank"> {
-  if (sortMode === "rank") return "traffic";
-  return sortMode;
+): "traffic" | "keywords" {
+  if (sortMode === "volume") return "keywords";
+  return "traffic";
 }
 
-export function normalizeDomainTarget(input: string): string | null {
-  const value = input.trim();
-  if (!value) return null;
-
-  const withProtocol = /^[a-zA-Z][a-zA-Z\d+.-]*:\/\//.test(value)
-    ? value
-    : `https://${value}`;
-
-  try {
-    const parsed = new URL(withProtocol);
-    const hostname = parsed.hostname.toLowerCase();
-    if (!hostname || !hostname.includes(".")) return null;
-    if (!/^[a-z\d.-]+$/.test(hostname)) return null;
-
-    const path = parsed.pathname === "/" ? "" : parsed.pathname;
-    return `${hostname}${path}`;
-  } catch {
-    return null;
-  }
+/** Normalized path of a domain input; `""` when it is a root or unparseable. */
+export function getResearchInputPath(input: string): string {
+  const parsed = parseResearchTarget(input);
+  return parsed.ok ? parsed.target.path : "";
 }
 
 export function formatNumber(value: number | null | undefined) {
@@ -83,52 +66,52 @@ export function formatNumber(value: number | null | undefined) {
   return new Intl.NumberFormat().format(value);
 }
 
-export function formatFloat(value: number | null | undefined) {
+export function formatRounded(value: number | null | undefined) {
   if (value == null) return "-";
-  if (value > 100) return new Intl.NumberFormat().format(Math.round(value));
-  return value.toFixed(2);
+  return new Intl.NumberFormat().format(Math.round(value));
 }
 
 export function formatMetric(
   value: number | null | undefined,
   hasData: boolean | undefined,
 ) {
-  if (!hasData) return "Not enough data";
-  return formatNumber(value);
+  // The page's "Not enough data" banner explains the empty values.
+  if (!hasData) return "-";
+  return formatRounded(value);
 }
 
-export function keywordsToCsv(rows: KeywordRow[]): string {
-  const headers = [
-    "Keyword",
-    "Rank",
-    "Volume",
-    "Traffic",
-    "CPC",
-    "URL",
-    "Score",
-  ];
-  const lines = rows.map((row) => [
-    row.keyword,
-    row.position,
-    row.searchVolume,
-    row.traffic,
-    row.cpc,
-    row.relativeUrl ?? row.url,
-    row.keywordDifficulty,
-  ]);
-  return buildCsv(headers, lines);
+type ExportTable = { headers: string[]; rows: (string | number | null)[][] };
+
+export function keywordsToTable(rows: KeywordRow[]): ExportTable {
+  return {
+    headers: ["Keyword", "Rank", "Volume", "Traffic", "CPC", "URL", "Score"],
+    rows: rows.map((row) => [
+      row.keyword,
+      row.position,
+      row.searchVolume,
+      row.traffic,
+      row.cpc,
+      row.url ?? row.relativeUrl,
+      row.keywordDifficulty,
+    ]),
+  };
 }
 
-export function pagesToCsv(rows: PageRow[]): string {
-  const headers = ["Page", "Organic Traffic", "Keywords"];
-  const lines = rows.map((row) => [
-    row.relativePath ?? row.page,
-    row.organicTraffic,
-    row.keywords,
-  ]);
-  return buildCsv(headers, lines);
+export function pagesToTable(rows: PageRow[]): ExportTable {
+  return {
+    headers: ["Page", "Organic Traffic", "Keywords"],
+    rows: rows.map((row) => [row.page, row.organicTraffic, row.keywords]),
+  };
 }
 
-export function downloadCsv(content: string, filename: string) {
-  downloadCsvFile(filename, content);
+/** Adapts the URL-driven domain sort to the shared `SortableHeader`. */
+export function domainSortColumn(
+  isActive: boolean,
+  order: SortOrder,
+  onClick: () => void,
+) {
+  return {
+    getIsSorted: () => (isActive ? order : false),
+    getToggleSortingHandler: () => onClick,
+  };
 }

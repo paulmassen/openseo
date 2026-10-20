@@ -1,22 +1,5 @@
 import { env } from "cloudflare:workers";
 
-export async function putJsonToR2(
-  key: string,
-  payload: Record<string, unknown>,
-): Promise<{ key: string; sizeBytes: number }> {
-  const body = JSON.stringify(payload);
-  await env.R2.put(key, body, {
-    httpMetadata: {
-      contentType: "application/json",
-    },
-  });
-
-  return {
-    key,
-    sizeBytes: Buffer.byteLength(body),
-  };
-}
-
 export async function getJsonFromR2(key: string): Promise<string> {
   const object = await env.R2.get(key);
   if (!object) {
@@ -40,4 +23,18 @@ export async function putTextToR2(
     key,
     sizeBytes: Buffer.byteLength(body),
   };
+}
+
+/** Deletes every object under `prefix`; returns how many were removed. */
+export async function deleteR2Prefix(bucket: R2Bucket, prefix: string) {
+  let cursor: string | undefined;
+  let deleted = 0;
+  do {
+    const page = await bucket.list({ prefix, cursor });
+    const keys = page.objects.map((object) => object.key);
+    if (keys.length) await bucket.delete(keys);
+    deleted += keys.length;
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return deleted;
 }

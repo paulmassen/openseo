@@ -1,162 +1,109 @@
-import { useNavigate } from "@tanstack/react-router";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useState } from "react";
-import { useKeywordControlsForm } from "@/client/features/keywords/hooks/useKeywordControlsForm";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
+import {
+  useKeywordControlsForm,
+  type KeywordControlsValues,
+} from "@/client/features/keywords/hooks/useKeywordControlsForm";
 import { useKeywordFiltering } from "@/client/features/keywords/hooks/useKeywordFiltering";
-import { usePreferredKeywordLocation } from "@/client/features/keywords/hooks/usePreferredKeywordLocation";
+import { usePreferredKeywordGrouping } from "@/client/features/keywords/hooks/usePreferredKeywordGrouping";
 import { useLocalKeywordFilters } from "@/client/features/keywords/hooks/useLocalKeywordFilters";
 import { useKeywordResearchData } from "@/client/features/keywords/hooks/useKeywordResearchData";
-import { useKeywordSelection } from "@/client/features/keywords/hooks/useKeywordSelection";
 import { useKeywordSerpAnalysis } from "@/client/features/keywords/hooks/useKeywordSerpAnalysis";
+import { captureClientEvent } from "@/client/lib/posthog";
 import { useSearchHistory } from "@/client/hooks/useSearchHistory";
 import {
   type KeywordMode,
   type ResultLimit,
 } from "@/client/features/keywords/keywordResearchTypes";
-import { saveKeywords } from "@/serverFunctions/keywords";
 import type { KeywordResearchRow } from "@/types/keywords";
 import type { SortDir, SortField } from "@/client/features/keywords/components";
 import {
+  buildKeywordSearchKey,
+  getNextSortParams,
   useSaveAndExportActions,
-  useSearchActions,
 } from "./keywordControllerActions";
+import {
+  useKeywordSaveMutation,
+  useKeywordSearchParams,
+  useKeywordUiState,
+} from "./keywordControllerInternals";
 import { useKeywordOverviewState } from "./useKeywordOverviewState";
 
 export type KeywordResearchControllerInput = {
   projectId: string;
   keywordInput: string;
-  locationCode: number;
-  hasExplicitLocationCode: boolean;
+  locationCode: number | undefined;
+  displayedLocationCode: number;
+  /** City, county, or region for local volume; undefined for national. */
+  locationName: string | undefined;
+  setPreferredLocationCode: (locationCode: number) => void;
   resultLimit: ResultLimit;
   keywordMode: KeywordMode;
+  clickstream: boolean;
+  /** Grouping of the displayed search. The toggle only applies to new searches. */
+  groupKeywords: boolean;
   sortField: SortField;
   sortDir: SortDir;
+  /**
+   * Called when the user submits the search form. Lets the caller decide
+   * whether the submission opens tabs or just rewrites the URL — the
+   * controller stays agnostic.
+   */
+  onFormSubmit: (value: KeywordSubmitValues) => void;
+};
+
+export type KeywordSubmitValues = KeywordControlsValues & {
+  groupKeywords: boolean;
 };
 
 export function useKeywordResearchController(
   input: KeywordResearchControllerInput,
 ) {
-  const state = useKeywordControllerState(input);
-
-  const { onSearch, handleSearchSubmit, toggleSort } = useSearchActions({
-    controlsForm: state.controlsForm,
-    input,
-    beginSearch: state.beginSearch,
-    runSearch: state.runSearch,
-    clearSelection: state.clearSelection,
-    setSelectedKeyword: state.setSelectedKeyword,
-    setSerpKeyword: state.setSerpKeyword,
-    setSerpPage: state.setSerpPage,
-    setSearchInputError: state.setSearchInputError,
-    setSearchParams: state.setSearchParams,
-    setPreferredLocationCode: state.setPreferredLocationCode,
-  });
-
-  const { handleSaveKeywords, confirmSave, exportCsv } =
-    useSaveAndExportActions({
-      selectedRows: state.selectedRows,
-      filteredRows: state.filteredRows,
-      input,
-      saveKeywordsMutate: state.saveMutation.mutate,
-      setShowSaveDialog: state.setShowSaveDialog,
-    });
-
-  const handleToggleAllRows = () => {
-    state.toggleAllRows(state.filteredRows.map((row) => row.keyword));
-  };
-
-  const handleRowClick = (row: KeywordResearchRow) => {
-    state.setSelectedKeyword(row);
-    state.setSerpKeyword(row.keyword);
-    state.setSerpPage(0);
-  };
-
-  return buildControllerOutput({
-    activeFilterCount: state.activeFilterCount,
-    activeSerpKeyword: state.activeSerpKeyword,
-    clearHistory: state.clearHistory,
-    confirmSave,
-    controlsForm: state.controlsForm,
-    exportCsv,
-    filteredRows: state.filteredRows,
-    filtersForm: state.filtersForm,
-    handleRowClick,
-    handleSaveKeywords,
-    handleSearchSubmit,
-    hasSearched: state.hasSearched,
-    history: state.history,
-    historyLoaded: state.historyLoaded,
-    isLoading: state.isLoading,
-    lastResultSource: state.lastResultSource,
-    lastSearchError: state.lastSearchError,
-    lastSearchKeyword: state.lastSearchKeyword,
-    lastSearchLocationCode: state.lastSearchLocationCode,
-    lastUsedFallback: state.lastUsedFallback,
-    mobileTab: state.mobileTab,
-    onSearch,
-    overviewKeyword: state.overviewKeyword,
-    removeHistoryItem: state.removeHistoryItem,
-    researchError: state.researchError,
-    resetFilters: state.resetFilters,
-    rows: state.rows,
-    searchedKeyword: state.searchedKeyword,
-    searchInputError: state.searchInputError,
-    selectedRows: state.selectedRows,
-    serpError: state.serpError,
-    serpLoading: state.serpLoading,
-    serpPage: state.serpPage,
-    serpQuery: state.serpQuery,
-    serpResults: state.serpResults,
-    setMobileTab: state.setMobileTab,
-    setSearchInputError: state.setSearchInputError,
-    setSerpPage: state.setSerpPage,
-    setShowFilters: state.setShowFilters,
-    setShowSaveDialog: state.setShowSaveDialog,
-    showApproximateMatchNotice: state.showApproximateMatchNotice,
-    showFilters: state.showFilters,
-    showSaveDialog: state.showSaveDialog,
-    sortDir: input.sortDir,
-    sortField: input.sortField,
-    toggleAllRows: handleToggleAllRows,
-    toggleRowSelection: state.toggleRowSelection,
-    toggleSort,
-    SERP_PAGE_SIZE: state.SERP_PAGE_SIZE,
-  });
-}
-
-function useKeywordControllerState(input: KeywordResearchControllerInput) {
-  const uiState = useKeywordUiState();
-  const { locationCode, setPreferredLocationCode } =
-    useResolvedKeywordLocation(input);
-
-  const controlsForm = useKeywordControlsForm({
-    ...input,
+  const {
+    displayedLocationCode,
+    groupKeywords,
     locationCode,
-  });
+    setPreferredLocationCode,
+  } = input;
+  const {
+    groupKeywords: preferredGroupKeywords,
+    setGroupKeywords: setPreferredGroupKeywords,
+  } = usePreferredKeywordGrouping(input.projectId);
   const {
     filtersForm,
     values: filterValues,
     resetFilters,
-  } = useLocalKeywordFilters();
-  const { selectedRows, clearSelection, toggleRowSelection, toggleAllRows } =
-    useKeywordSelection();
+  } = useLocalKeywordFilters(input.projectId);
+  const uiState = useKeywordUiState(
+    Object.values(filterValues).some((v) => v.trim() !== ""),
+  );
+  const [selectedRows, setSelectedRows] = useState<Set<string>>(new Set());
   const {
     setSerpKeyword,
     serpPage,
     setSerpPage,
     SERP_PAGE_SIZE,
-    serpQuery,
     serpResults,
     activeSerpKeyword,
     serpLoading,
+    serpLoadingMore,
+    canLoadMoreSerp,
+    deepFetchFailed,
+    retrySerp,
     serpError,
-  } = useKeywordSerpAnalysis(locationCode);
+    serpOutOfCredits,
+    serpRetrying,
+  } = useKeywordSerpAnalysis(input.projectId, locationCode, input.locationName);
 
   const {
     history,
     isLoaded: historyLoaded,
     addSearch,
-    clearHistory,
     removeHistoryItem,
   } = useSearchHistory(input.projectId);
 
@@ -164,21 +111,96 @@ function useKeywordControllerState(input: KeywordResearchControllerInput) {
     rows,
     hasSearched,
     lastSearchError,
-    lastResultSource,
-    lastUsedFallback,
     lastSearchKeyword,
     lastSearchLocationCode,
     researchError,
+    researchMutationError,
+    researchQuery,
     searchedKeyword,
     isLoading,
-    beginSearch,
-    runSearch,
-  } = useKeywordResearchData(addSearch);
+    retryResearch,
+  } = useKeywordResearchData(
+    {
+      projectId: input.projectId,
+      keywordInput: input.keywordInput,
+      locationCode,
+      displayedLocationCode,
+      locationName: input.locationName,
+      resultLimit: input.resultLimit,
+      mode: input.keywordMode,
+      clickstream: input.clickstream,
+      groupKeywords,
+    },
+    addSearch,
+  );
   const setSearchParams = useKeywordSearchParams();
   const saveMutation = useKeywordSaveMutation(input.projectId);
 
+  const activeSearchKey = input.keywordInput.trim()
+    ? buildKeywordSearchKey({
+        keyword: input.keywordInput,
+        locationCode,
+        locationName: input.locationName,
+        resultLimit: input.resultLimit,
+        mode: input.keywordMode,
+        clickstream: input.clickstream,
+        groupKeywords,
+      })
+    : null;
+
+  const previousSearchKeyRef = useRef<string | null>(null);
+  const handledSerpSearchKeyRef = useRef<string | null>(null);
+
+  const clearActiveKeywordResult = useCallback(() => {
+    setSelectedRows(new Set());
+    uiState.setSelectedKeyword(null);
+    setSerpKeyword(null);
+    setSerpPage(0);
+  }, [setSerpKeyword, setSerpPage, uiState]);
+
+  const onFormSubmit = input.onFormSubmit;
+  const controlsForm = useKeywordControlsForm(
+    {
+      ...input,
+      locationCode: displayedLocationCode,
+    },
+    (value) => {
+      setPreferredLocationCode(value.locationCode);
+      onFormSubmit({ ...value, groupKeywords: preferredGroupKeywords });
+    },
+  );
+
+  // The URL defines keyword research queries. This effect only resets UI state
+  // around a new query key; TanStack Query owns the actual fetch, cache,
+  // dedupe, and error lifecycle.
+  useEffect(() => {
+    if (activeSearchKey === previousSearchKeyRef.current) return;
+    previousSearchKeyRef.current = activeSearchKey;
+    handledSerpSearchKeyRef.current = null;
+
+    clearActiveKeywordResult();
+  }, [activeSearchKey, clearActiveKeywordResult]);
+
+  useEffect(() => {
+    if (!activeSearchKey || !researchQuery.isSuccess) return;
+    if (handledSerpSearchKeyRef.current === activeSearchKey) return;
+
+    handledSerpSearchKeyRef.current = activeSearchKey;
+    setSerpKeyword(rows.length > 0 ? searchedKeyword : null);
+    setSerpPage(0);
+  }, [
+    activeSearchKey,
+    researchQuery.isSuccess,
+    rows.length,
+    searchedKeyword,
+    setSerpKeyword,
+    setSerpPage,
+  ]);
+
   const { filteredRows, activeFilterCount } = useKeywordFiltering({
+    groupKeywords,
     rows,
+    searchedKeyword,
     filters: filterValues,
     sortField: input.sortField,
     sortDir: input.sortDir,
@@ -195,130 +217,102 @@ function useKeywordControllerState(input: KeywordResearchControllerInput) {
       keywordMode: input.keywordMode,
     });
 
-  return buildKeywordControllerState({
+  const retrySearch = useCallback(() => {
+    void retryResearch();
+  }, [retryResearch]);
+
+  const handleSearchSubmit = useCallback(
+    (event: FormEvent) => {
+      event.preventDefault();
+      void controlsForm.handleSubmit();
+    },
+    [controlsForm],
+  );
+
+  const toggleSort = useCallback(
+    (field: SortField) => {
+      setSearchParams(getNextSortParams(input.sortField, input.sortDir, field));
+    },
+    [input.sortDir, input.sortField, setSearchParams],
+  );
+
+  const {
+    handleSaveKeywords,
+    confirmSave,
+    selectedKeywordRows,
+    exportAll,
+    exportSelection,
+  } = useSaveAndExportActions({
+    selectedRows,
+    filteredRows,
+    input,
+    saveKeywordsMutate: saveMutation.mutate,
+    setShowSaveDialog: uiState.setShowSaveDialog,
+  });
+
+  const handleRowClick = (row: KeywordResearchRow) => {
+    captureClientEvent("keyword_research:serp_open");
+    uiState.setSelectedKeyword(row);
+    setSerpKeyword(row.keyword);
+    setSerpPage(0);
+  };
+
+  return {
+    preferredGroupKeywords,
+    setPreferredGroupKeywords,
     activeFilterCount,
     activeSerpKeyword,
-    beginSearch,
-    clearSelection,
-    clearHistory,
+    confirmSave,
     controlsForm,
+    exportAll,
+    exportSelection,
     filteredRows,
     filtersForm,
+    handleRowClick,
+    handleSaveKeywords,
+    handleSearchSubmit,
     hasSearched,
     history,
     historyLoaded,
     isLoading,
-    lastResultSource,
-    lastSearchError,
     lastSearchKeyword,
     lastSearchLocationCode,
-    lastUsedFallback,
+    locationName: input.locationName,
     mobileTab: uiState.mobileTab,
     overviewKeyword,
     removeHistoryItem,
     researchError,
-    runSearch,
+    researchMutationError,
+    // `isLoading` stays false while a failed query refetches.
+    researchRetrying: researchQuery.isFetching,
+    retrySearch,
     resetFilters,
+    retrySerp,
     rows,
+    savePending: saveMutation.isPending,
     searchedKeyword,
-    searchInputError: uiState.searchInputError,
-    selectedKeyword: uiState.selectedKeyword,
     selectedRows,
-    saveMutation,
-    setPreferredLocationCode,
-    setSelectedKeyword: uiState.setSelectedKeyword,
-    setSearchParams,
-    setSerpKeyword,
+    selectedKeywordRows,
+    canLoadMoreSerp,
+    deepFetchFailed,
     serpError,
+    serpOutOfCredits,
+    serpRetrying,
     serpLoading,
+    serpLoadingMore,
     serpPage,
-    serpQuery,
     serpResults,
     setMobileTab: uiState.setMobileTab,
-    setSearchInputError: uiState.setSearchInputError,
+    setSelectedRows,
     setSerpPage,
     setShowFilters: uiState.setShowFilters,
     setShowSaveDialog: uiState.setShowSaveDialog,
     showApproximateMatchNotice,
     showFilters: uiState.showFilters,
     showSaveDialog: uiState.showSaveDialog,
-    toggleAllRows,
-    toggleRowSelection,
+    sortDir: input.sortDir,
+    sortField: input.sortField,
+    toggleSort,
     SERP_PAGE_SIZE,
-  });
-}
-
-function useResolvedKeywordLocation(input: KeywordResearchControllerInput) {
-  const { preferredLocationCode, setPreferredLocationCode } =
-    usePreferredKeywordLocation();
-  const locationCode =
-    !input.hasExplicitLocationCode && input.keywordInput === ""
-      ? preferredLocationCode
-      : input.locationCode;
-
-  return { locationCode, setPreferredLocationCode };
-}
-
-function useKeywordUiState() {
-  const [showFilters, setShowFilters] = useState(false);
-  const [selectedKeyword, setSelectedKeyword] =
-    useState<KeywordResearchRow | null>(null);
-  const [searchInputError, setSearchInputError] = useState<string | null>(null);
-  const [showSaveDialog, setShowSaveDialog] = useState(false);
-  const [mobileTab, setMobileTab] = useState<"keywords" | "serp">("keywords");
-
-  return {
-    mobileTab,
-    searchInputError,
-    selectedKeyword,
-    setMobileTab,
-    setSearchInputError,
-    setSelectedKeyword,
-    setShowFilters,
-    setShowSaveDialog,
-    showFilters,
-    showSaveDialog,
   };
-}
-
-function useKeywordSearchParams() {
-  const navigate = useNavigate({ from: "/p/$projectId/keywords" });
-
-  return useCallback(
-    (updates: Record<string, string | number | boolean | undefined>) => {
-      void navigate({
-        search: (prev) => ({ ...prev, ...updates }),
-        replace: true,
-      });
-    },
-    [navigate],
-  );
-}
-
-function useKeywordSaveMutation(projectId: string) {
-  const queryClient = useQueryClient();
-
-  return useMutation({
-    mutationFn: (data: {
-      projectId: string;
-      keywords: string[];
-      locationCode: number;
-      languageCode: string;
-    }) => saveKeywords({ data }),
-    onSuccess: () => {
-      void queryClient.invalidateQueries({
-        queryKey: ["savedKeywords", projectId],
-      });
-    },
-  });
-}
-
-function buildControllerOutput<T extends Record<string, unknown>>(state: T): T {
-  return state;
-}
-
-function buildKeywordControllerState<T extends Record<string, unknown>>(
-  state: T,
-): T {
-  return state;
 }

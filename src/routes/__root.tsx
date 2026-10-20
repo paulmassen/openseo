@@ -2,39 +2,50 @@
 import {
   ClientOnly,
   HeadContent,
+  Outlet,
   Scripts,
   createRootRoute,
-  useLocation,
 } from "@tanstack/react-router";
 import { TanStackRouterDevtoolsPanel } from "@tanstack/react-router-devtools";
 import { TanStackDevtools } from "@tanstack/react-devtools";
 import { QueryClientProvider } from "@tanstack/react-query";
 import * as React from "react";
-import { useState } from "react";
 import { DefaultCatchBoundary } from "@/client/components/DefaultCatchBoundary";
+import { captureGoogleLinkError } from "@/client/features/integrations/googleLinkError";
+import { ExportToSheetsModal } from "@/client/components/table/ExportToSheetsModal";
+import { themePreferenceInitScript } from "@/client/lib/theme";
 import { NotFound } from "@/client/components/NotFound";
+import { PrivacyBootstrap } from "@/client/components/PrivacyChoices";
+import { TooltipProvider } from "@/client/components/ui/tooltip";
 import appCss from "@/client/styles/app.css?url";
 import { Toaster } from "sonner";
 import { queryClient } from "@/client/tanstack-db";
-import { getSeoApiKeyStatus } from "@/serverFunctions/config";
-import {
-  AppContent,
-  MissingSeoSetupModal,
-  SeoApiStatusBanners,
-  TopNav,
-} from "@/client/layout/AppShell";
 
-const DATAFORSEO_HELP_PATH = "/help/dataforseo-api-key";
+// Capture Google link error params before the router starts — a route loader
+// redirect would otherwise replace the URL and lose them. See googleLinkError.ts.
+captureGoogleLinkError();
 
 export const Route = createRootRoute({
   head: () => ({
     meta: [
+      {
+        title: "OpenSEO",
+      },
       {
         charSet: "utf-8",
       },
       {
         name: "viewport",
         content: "width=device-width, initial-scale=1, viewport-fit=cover",
+      },
+      // Disable browser auto-translate (Google Translate) app-wide. It rewrites
+      // text nodes into <font> wrappers, which React then can't remove/insert,
+      // crashing render with NotFoundError ("removeChild"/"insertBefore"). The
+      // product UI is data-dense (keywords, domains, metrics) and not meaningful
+      // to machine-translate; the marketing site is a separate app and unaffected.
+      {
+        name: "google",
+        content: "notranslate",
       },
       {
         name: "apple-mobile-web-app-capable",
@@ -64,7 +75,8 @@ export const Route = createRootRoute({
         sizes: "16x16",
         href: "/favicon-16x16.png",
       },
-      { rel: "icon", href: "/favicon.ico" },
+      { rel: "icon", type: "image/x-icon", href: "/favicon.ico" },
+      { rel: "manifest", href: "/site.webmanifest" },
     ],
     scripts: [],
   }),
@@ -75,103 +87,7 @@ export const Route = createRootRoute({
 });
 
 function AppLayout() {
-  const location = useLocation();
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  const setupModalRef = React.useRef<HTMLDivElement | null>(null);
-  const [isSeoApiKeyConfigured, setIsSeoApiKeyConfigured] = useState<
-    boolean | null
-  >(null);
-  const [seoApiKeyStatusError, setSeoApiKeyStatusError] = useState(false);
-  const [showMissingSeoApiKeyModal, setShowMissingSeoApiKeyModal] =
-    useState(false);
-
-  // Extract projectId from the current path
-  const projectIdMatch = location.pathname.match(/^\/p\/([^/]+)/);
-  const projectId = projectIdMatch?.[1] ?? null;
-
-  React.useEffect(() => {
-    let cancelled = false;
-
-    const checkSeoApiKeyStatus = async () => {
-      try {
-        const result = await getSeoApiKeyStatus();
-        if (cancelled) return;
-
-        setSeoApiKeyStatusError(false);
-        setIsSeoApiKeyConfigured(result.configured);
-        if (!result.configured) {
-          setShowMissingSeoApiKeyModal(true);
-        }
-      } catch {
-        if (cancelled) return;
-        setSeoApiKeyStatusError(true);
-        setIsSeoApiKeyConfigured(null);
-        setShowMissingSeoApiKeyModal(false);
-      }
-    };
-
-    void checkSeoApiKeyStatus();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  const shouldShowMissingSeoApiKeyModal =
-    showMissingSeoApiKeyModal && location.pathname !== DATAFORSEO_HELP_PATH;
-
-  const shouldShowSeoApiWarning =
-    !seoApiKeyStatusError &&
-    isSeoApiKeyConfigured === false &&
-    !shouldShowMissingSeoApiKeyModal;
-
-  React.useEffect(() => {
-    if (!shouldShowMissingSeoApiKeyModal) return;
-
-    setupModalRef.current?.focus();
-
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setShowMissingSeoApiKeyModal(false);
-      }
-    };
-
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [shouldShowMissingSeoApiKeyModal]);
-
-  return (
-    <div className="flex flex-col h-[100dvh] bg-base-200">
-      <TopNav
-        drawerOpen={drawerOpen}
-        projectId={projectId}
-        pathname={location.pathname}
-        onOpenDrawer={() => setDrawerOpen(true)}
-      />
-
-      <SeoApiStatusBanners
-        helpPath={DATAFORSEO_HELP_PATH}
-        shouldShowSeoApiWarning={shouldShowSeoApiWarning}
-        seoApiKeyStatusError={seoApiKeyStatusError}
-      />
-
-      <AppContent
-        drawerOpen={drawerOpen}
-        pathname={location.pathname}
-        projectId={projectId}
-        onCloseDrawer={() => setDrawerOpen(false)}
-      />
-
-      <MissingSeoSetupModal
-        ref={setupModalRef}
-        helpPath={DATAFORSEO_HELP_PATH}
-        isOpen={shouldShowMissingSeoApiKeyModal}
-        onClose={() => setShowMissingSeoApiKeyModal(false)}
-      />
-    </div>
-  );
+  return <Outlet />;
 }
 
 function RootDocument({ children }: { children: React.ReactNode }) {
@@ -179,15 +95,20 @@ function RootDocument({ children }: { children: React.ReactNode }) {
     import.meta.env.DEV && import.meta.env.VITE_SHOW_DEVTOOLS !== "false";
 
   return (
-    <html>
+    <html suppressHydrationWarning translate="no">
       <head>
+        <script
+          dangerouslySetInnerHTML={{ __html: themePreferenceInitScript }}
+        />
         <HeadContent />
       </head>
       <body>
         <ClientOnly>
           <QueryClientProvider client={queryClient}>
-            <>
+            <TooltipProvider>
+              <PrivacyBootstrap />
               {children}
+              <ExportToSheetsModal />
               <Toaster position="bottom-right" mobileOffset={{ bottom: 100 }} />
               {showDevtools ? (
                 <TanStackDevtools
@@ -202,7 +123,7 @@ function RootDocument({ children }: { children: React.ReactNode }) {
                   ]}
                 />
               ) : null}
-            </>
+            </TooltipProvider>
           </QueryClientProvider>
         </ClientOnly>
         <Scripts />

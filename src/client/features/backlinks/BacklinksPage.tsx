@@ -1,90 +1,183 @@
+import { useCallback, useMemo } from "react";
+import type { SortingState, Updater } from "@tanstack/react-table";
+import { BackLink, PageHeader } from "@/client/components/PageHeader";
 import { BacklinksSearchCard } from "./BacklinksSearchCard";
 import { BacklinksBody } from "./BacklinksPageContent";
 import type { BacklinksPageProps } from "./backlinksPageTypes";
 import {
   navigateToBacklinksSearch,
-  navigateToBacklinksTab,
   useBacklinksPageData,
 } from "./useBacklinksPageData";
-import { getStandardErrorMessage } from "@/client/lib/error-messages";
+import { useBacklinksDomainExpansion } from "./useBacklinksDomainExpansion";
+import { useBacklinksFilters } from "./useBacklinksFilters";
+import { useBacklinksSearchHistory } from "@/client/hooks/useBacklinksSearchHistory";
+import type { SearchTabInput } from "@/client/features/search-tabs/types";
+import { useSearchTabNavigation } from "@/client/features/search-tabs/useSearchTabNavigation";
+import {
+  BACKLINKS_DEFAULT_SORT,
+  DEFAULT_BACKLINKS_PAGE_SIZE,
+} from "@/types/schemas/backlinks";
 
 export function BacklinksPage({
   projectId,
   searchState,
   navigate,
 }: BacklinksPageProps) {
-  const {
-    accessStatus,
-    accessStatusErrorMessage,
-    accessStatusQuery,
-    activeTabErrorMessage,
-    backlinksDisabledByError,
-    backlinksEnabled,
-    overviewErrorMessage,
-    overviewQuery,
-    referringDomainsQuery,
-    searchCardInitialValues,
-    testAccessMutation,
-    topPagesQuery,
-  } = useBacklinksPageData({ projectId, searchState });
+  const filters = useBacklinksFilters();
 
+  // Sort lives in the URL so sort changes and the page reset commit in one
+  // navigation (no transient fetch of the old page with the new sort).
+  const sorting = useMemo<SortingState>(() => {
+    const fallback = BACKLINKS_DEFAULT_SORT[searchState.tab];
+    const field = searchState.sort ?? fallback.field;
+    const order =
+      searchState.order ?? (searchState.sort ? "desc" : fallback.order);
+    return [{ id: field, desc: order === "desc" }];
+  }, [searchState.order, searchState.sort, searchState.tab]);
+
+  const updateSearch = useCallback(
+    (updates: Record<string, unknown>) => {
+      navigate({ search: (prev) => ({ ...prev, ...updates }), replace: true });
+    },
+    [navigate],
+  );
+
+  const handleSortingChange = useCallback(
+    (updater: Updater<SortingState>) => {
+      const next = typeof updater === "function" ? updater(sorting) : updater;
+      const first = next[0];
+      updateSearch({
+        sort: first?.id,
+        order: first ? (first.desc ? "desc" : "asc") : undefined,
+        page: undefined,
+      });
+    },
+    [sorting, updateSearch],
+  );
+
+  const data = useBacklinksPageData({ projectId, searchState, filters });
+
+  const domainExpansion = useBacklinksDomainExpansion({
+    projectId,
+    searchState,
+    rows: data.activeTabErrorMessage ? [] : (data.rowsQuery.data?.rows ?? []),
+  });
+
+  const {
+    history,
+    isLoaded: historyLoaded,
+    addSearch,
+    removeHistoryItem,
+  } = useBacklinksSearchHistory(projectId);
+  const urlTabInput = useMemo<SearchTabInput | null>(() => {
+    if (searchState.target.trim() === "") return null;
+    return {
+      type: "backlinks",
+      target: searchState.target,
+      scope: searchState.scope,
+    };
+  }, [searchState.scope, searchState.target]);
+  const navigateToTab = useCallback(
+    (input: SearchTabInput | null) => {
+      if (input?.type !== "backlinks") {
+        navigate({
+          search: () => ({}),
+          replace: true,
+        });
+        return;
+      }
+      navigateToBacklinksSearch(navigate, {
+        target: input.target,
+        scope: input.scope,
+      });
+    },
+    [navigate],
+  );
+  const searchTabs = useSearchTabNavigation({
+    storageKey: `backlinks:${projectId}`,
+    urlInput: urlTabInput,
+    getLabel: useCallback(
+      (input) => (input.type === "backlinks" ? input.target : ""),
+      [],
+    ),
+    navigateToInput: navigateToTab,
+  });
   return (
     <div className="px-4 py-4 pb-24 overflow-auto md:px-6 md:py-6 md:pb-8">
       <div className="mx-auto max-w-7xl space-y-4">
-        <div>
-          <h1 className="text-2xl font-semibold">Backlinks</h1>
-          <p className="text-sm text-base-content/70">
-            Understand who links to a site, what changed recently, and which
-            pages attract links.
-          </p>
-        </div>
+        <PageHeader
+          title="Backlinks"
+          description="Understand who links to a site, what changed recently, and which pages attract links."
+          backLink={
+            searchState.target ? (
+              <BackLink
+                to="/p/$projectId/backlinks"
+                params={{ projectId }}
+                search={{
+                  target: undefined,
+                  scope: undefined,
+                  tab: undefined,
+                  page: undefined,
+                  size: undefined,
+                  sort: undefined,
+                  order: undefined,
+                }}
+                replace
+              >
+                Recent searches
+              </BackLink>
+            ) : undefined
+          }
+        />
 
-        {!accessStatusQuery.isLoading &&
-        backlinksEnabled &&
-        !backlinksDisabledByError ? (
-          <BacklinksSearchCard
-            errorMessage={overviewErrorMessage}
-            initialValues={searchCardInitialValues}
-            isFetching={
-              overviewQuery.isFetching ||
-              referringDomainsQuery.isFetching ||
-              topPagesQuery.isFetching
-            }
-            onSubmit={(values) => navigateToBacklinksSearch(navigate, values)}
-          />
-        ) : null}
+        <BacklinksSearchCard
+          initialValues={data.searchCardInitialValues}
+          onSubmit={(values) => {
+            searchTabs.openTab({ type: "backlinks", ...values });
+            navigateToBacklinksSearch(navigate, values);
+            addSearch({ target: values.target, scope: values.scope });
+          }}
+        />
 
         <BacklinksBody
-          accessStatus={accessStatus}
-          accessStatusError={accessStatusErrorMessage}
-          backlinksDisabledByError={backlinksDisabledByError}
-          backlinksEnabled={backlinksEnabled}
-          isAccessStatusLoading={accessStatusQuery.isLoading}
-          overviewData={overviewQuery.data}
-          overviewError={overviewErrorMessage}
-          overviewLoading={overviewQuery.isLoading}
-          referringDomains={referringDomainsQuery.data}
+          projectId={projectId}
+          history={history}
+          historyLoaded={historyLoaded}
+          data={data}
           searchState={searchState}
-          tabErrorMessage={activeTabErrorMessage}
-          tabLoading={
-            (searchState.tab === "domains" &&
-              referringDomainsQuery.isLoading) ||
-            (searchState.tab === "pages" && topPagesQuery.isLoading)
+          filters={filters}
+          sorting={sorting}
+          domainExpansion={domainExpansion}
+          searchTabs={searchTabs}
+          onPageChange={(nextPage) =>
+            updateSearch({ page: nextPage === 1 ? undefined : nextPage })
           }
-          testError={
-            testAccessMutation.error
-              ? getStandardErrorMessage(
-                  testAccessMutation.error,
-                  "Could not test Backlinks access.",
-                )
-              : null
+          onPageSizeChange={(nextPageSize) =>
+            updateSearch({
+              size:
+                nextPageSize === DEFAULT_BACKLINKS_PAGE_SIZE
+                  ? undefined
+                  : nextPageSize,
+              page: undefined,
+            })
           }
-          testIsPending={testAccessMutation.isPending}
-          topPages={topPagesQuery.data}
-          onRetryAccess={() => void accessStatusQuery.refetch()}
-          onSetActiveTab={(tab) => navigateToBacklinksTab(navigate, tab)}
-          onRetryOverview={() => void overviewQuery.refetch()}
-          onTestAccess={() => testAccessMutation.mutate()}
+          onRemoveHistoryItem={removeHistoryItem}
+          onSortingChange={handleSortingChange}
+          onTabChange={(tab) =>
+            updateSearch({
+              tab: tab === "backlinks" ? undefined : tab,
+              page: undefined,
+              sort: undefined,
+              order: undefined,
+            })
+          }
+          onViewChange={(view) => updateSearch({ view, page: undefined })}
+          onHideSpamChange={(hideSpam) =>
+            updateSearch({
+              includeSpam: hideSpam ? undefined : true,
+              page: undefined,
+            })
+          }
         />
       </div>
     </div>

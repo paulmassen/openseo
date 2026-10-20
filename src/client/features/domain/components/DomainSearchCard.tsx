@@ -1,176 +1,130 @@
-import type { ComponentType, FormEvent, ReactNode } from "react";
-import { AlertCircle, Search } from "lucide-react";
+import type { FormEvent } from "react";
+import { useStore } from "@tanstack/react-form";
+import { getFieldError } from "@/client/lib/forms";
+import type { DomainOverviewControlsForm } from "@/client/features/domain/DomainOverviewPage";
 import { toSortMode } from "@/client/features/domain/utils";
 import type { DomainSortMode } from "@/client/features/domain/types";
+import { LABS_LOCATION_OPTIONS } from "@/client/features/keywords/locations";
+import { LocationSelect } from "@/client/components/LocationSelect";
+import { ResearchScopeSelect } from "@/client/components/ResearchScopeSelect";
+import { SearchCard, SearchInput } from "@/client/components/SearchCard";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/client/components/ui/select";
+import type { ResearchScope } from "@/shared/researchScope";
 
-type FieldHost = {
-  Field: ComponentType<{
-    name: "domain" | "sort" | "subdomains";
-    children: (field: unknown) => ReactNode;
-  }>;
-};
-
-type TextField = {
-  state: { value: string };
-  handleChange: (value: string) => void;
-};
-
-type SortField = {
-  state: { value: DomainSortMode };
-  handleChange: (value: DomainSortMode) => void;
-};
-
-type ToggleField = {
-  state: { value: boolean };
-  handleChange: (value: boolean) => void;
-};
-
-function isTextField(field: unknown): field is TextField {
-  if (!field || typeof field !== "object") return false;
-  const candidate = field as {
-    state?: { value?: unknown };
-    handleChange?: unknown;
-  };
-  return (
-    typeof candidate.handleChange === "function" &&
-    typeof candidate.state?.value === "string"
-  );
-}
-
-function isSortField(field: unknown): field is SortField {
-  if (!isTextField(field)) return false;
-  return (
-    field.state.value === "rank" ||
-    field.state.value === "traffic" ||
-    field.state.value === "volume"
-  );
-}
-
-function isToggleField(field: unknown): field is ToggleField {
-  if (!field || typeof field !== "object") return false;
-  const candidate = field as {
-    state?: { value?: unknown };
-    handleChange?: unknown;
-  };
-  return (
-    typeof candidate.handleChange === "function" &&
-    typeof candidate.state?.value === "boolean"
-  );
-}
+const SORT_ITEMS: { value: DomainSortMode; label: string }[] = [
+  { value: "rank", label: "By Rank" },
+  { value: "traffic", label: "By Traffic" },
+  { value: "volume", label: "By Volume" },
+  { value: "score", label: "By Score" },
+  { value: "cpc", label: "By CPC" },
+];
 
 type Props = {
-  controlsForm: FieldHost;
-  domainError: string | null;
-  overviewError: string | null;
+  controlsForm: DomainOverviewControlsForm;
   isLoading: boolean;
   onSubmit: (event: FormEvent) => void;
+  onDomainChange: (domain: string) => void;
+  onScopeChange: (scope: ResearchScope) => void;
   onSortChange: (sort: DomainSortMode) => void;
-  onDomainInput: () => void;
+  onLocationChange: (locationCode: number) => void;
 };
 
 export function DomainSearchCard({
   controlsForm,
-  domainError,
-  overviewError,
   isLoading,
   onSubmit,
+  onDomainChange,
+  onScopeChange,
   onSortChange,
-  onDomainInput,
+  onLocationChange,
 }: Props) {
+  const domainError = useStore(controlsForm.store, (state) =>
+    getFieldError(state.fieldMeta.domain?.errors ?? []),
+  );
+
   return (
-    <div className="card bg-base-100 border border-base-300">
-      <div className="card-body gap-4">
-        <form
-          className="grid grid-cols-1 gap-3 lg:grid-cols-12"
-          onSubmit={onSubmit}
-        >
-          <label
-            className={`input input-bordered lg:col-span-8 flex items-center gap-2 ${domainError ? "input-error" : ""}`}
-          >
-            <Search className="size-4 text-base-content/60" />
-            <controlsForm.Field name="domain">
-              {(field) => {
-                if (!isTextField(field)) return null;
-                return (
-                  <input
-                    placeholder="Enter a domain (e.g. coolify.io or example.com/blog)"
-                    value={field.state.value}
-                    onChange={(e) => {
-                      field.handleChange(e.target.value);
-                      onDomainInput();
-                    }}
-                    aria-invalid={domainError ? true : undefined}
-                    aria-describedby={
-                      domainError ? "domain-input-error" : undefined
-                    }
-                  />
-                );
-              }}
-            </controlsForm.Field>
-          </label>
-
-          <controlsForm.Field name="sort">
-            {(field) => {
-              if (!isSortField(field)) return null;
-              return (
-                <select
-                  className="select select-bordered lg:col-span-2"
-                  value={field.state.value}
-                  onChange={(e) => {
-                    const next = toSortMode(e.target.value) ?? "rank";
-                    field.handleChange(next);
-                    onSortChange(next);
-                  }}
-                >
-                  <option value="rank">By Rank</option>
-                  <option value="traffic">By Traffic</option>
-                  <option value="volume">By Volume</option>
-                </select>
-              );
+    <SearchCard
+      onSubmit={onSubmit}
+      pending={isLoading}
+      error={domainError}
+      errorId="domain-input-error"
+    >
+      <controlsForm.Field name="domain">
+        {(field) => (
+          <SearchInput
+            placeholder="Enter a domain or URL"
+            aria-label="Domain or URL"
+            value={field.state.value}
+            onChange={(event) => {
+              field.handleChange(event.target.value);
+              onDomainChange(event.target.value);
             }}
-          </controlsForm.Field>
+            aria-invalid={domainError ? true : undefined}
+            aria-describedby={domainError ? "domain-input-error" : undefined}
+          />
+        )}
+      </controlsForm.Field>
 
-          <button
-            type="submit"
-            className="btn btn-primary lg:col-span-2"
-            disabled={isLoading}
+      <controlsForm.Field name="scope">
+        {(field) => (
+          <ResearchScopeSelect
+            value={field.state.value}
+            className="w-full lg:w-40"
+            onChange={(scope) => {
+              field.handleChange(scope);
+              onScopeChange(scope);
+            }}
+          />
+        )}
+      </controlsForm.Field>
+
+      <controlsForm.Field name="locationCode">
+        {(field) => (
+          <LocationSelect
+            value={field.state.value}
+            options={LABS_LOCATION_OPTIONS}
+            className="w-full lg:w-44 lg:shrink-0"
+            onChange={(code) => {
+              field.handleChange(code);
+              onLocationChange(code);
+            }}
+          />
+        )}
+      </controlsForm.Field>
+
+      <controlsForm.Field name="sort">
+        {(field) => (
+          <Select
+            items={SORT_ITEMS}
+            value={field.state.value}
+            onValueChange={(value) => {
+              const next = toSortMode(value ?? "") ?? "traffic";
+              field.handleChange(next);
+              onSortChange(next);
+            }}
           >
-            {isLoading ? "Loading..." : "Search"}
-          </button>
-        </form>
-
-        {domainError ? (
-          <p id="domain-input-error" className="text-sm text-error">
-            {domainError}
-          </p>
-        ) : null}
-
-        {overviewError ? (
-          <div className="rounded-lg border border-error/30 bg-error/10 p-3 text-sm text-error flex items-start gap-2">
-            <AlertCircle className="size-4 shrink-0 mt-0.5" />
-            <span>{overviewError}</span>
-          </div>
-        ) : null}
-
-        <div className="flex flex-wrap items-center gap-3">
-          <label className="label cursor-pointer gap-2 py-0">
-            <controlsForm.Field name="subdomains">
-              {(field) => {
-                if (!isToggleField(field)) return null;
-                return (
-                  <input
-                    type="checkbox"
-                    className="checkbox checkbox-sm"
-                    checked={field.state.value}
-                    onChange={(e) => field.handleChange(e.target.checked)}
-                  />
-                );
-              }}
-            </controlsForm.Field>
-            <span className="label-text">Include subdomains</span>
-          </label>
-        </div>
-      </div>
-    </div>
+            <SelectTrigger
+              aria-label="Sort keywords"
+              className="w-full shrink-0 lg:w-36"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {SORT_ITEMS.map((item) => (
+                <SelectItem key={item.value} value={item.value}>
+                  {item.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+      </controlsForm.Field>
+    </SearchCard>
   );
 }

@@ -1,7 +1,12 @@
-import { existsSync, readFileSync } from "node:fs";
 import process from "node:process";
 import { createBacklinksService } from "@/server/features/backlinks/services/BacklinksService";
-import type { BacklinksLookupInput } from "@/types/schemas/backlinks";
+import type { BillingCustomerContext } from "@/server/billing/subscription";
+import type {
+  BacklinksLookupInput,
+  BacklinksTargetScope,
+} from "@/types/schemas/backlinks";
+import { backlinksScopeParamSchema } from "@/types/schemas/backlinks";
+import { loadLocalEnv, parseArgs } from "./cli-utils";
 
 loadLocalEnv();
 
@@ -33,43 +38,60 @@ async function main() {
   }
 
   const input = buildInput(args);
+  const billingCustomer = buildBillingCustomer(args);
   const repeat = parsePositiveInteger(args.repeat, 1);
   const includeTabs = parseBoolean(args.includeTabs, true);
   const runs = [];
 
+  const pageInput = {
+    ...input,
+    page: 1,
+    pageSize: 100,
+    sortOrder: "desc",
+  } as const;
+
   for (let index = 0; index < repeat; index += 1) {
-    const overview = await service.profileOverview(input);
-    const domains = includeTabs
-      ? await service.profileReferringDomains(input)
+    const overview = await service.profileOverview(input, billingCustomer);
+    const rows = includeTabs
+      ? await service.profileBacklinksPage(
+          { ...pageInput, sortField: "rank", filters: {}, mode: "as_is" },
+          billingCustomer,
+        )
       : null;
-    const pages = includeTabs ? await service.profileTopPages(input) : null;
+    const domains = includeTabs
+      ? await service.profileReferringDomainsPage(
+          { ...pageInput, sortField: "backlinks", filters: {} },
+          billingCustomer,
+        )
+      : null;
+    const pages = includeTabs
+      ? await service.profileTopPagesPage(
+          { ...pageInput, sortField: "backlinks", filters: {} },
+          billingCustomer,
+        )
+      : null;
 
     runs.push({
       run: index + 1,
       overview: {
-        fromCache: overview.billing.fromCache,
-        totalCostUsd: overview.billing.totalCostUsd,
-        calls: overview.billing.calls,
+        trendRows: overview.overview.trends.length,
+        newLostRows: overview.overview.newLostTrends.length,
       },
+      backlinksTab: rows
+        ? {
+            rows: rows.rows.length,
+          }
+        : null,
       domainsTab: domains
         ? {
-            fromCache: domains.billing.fromCache,
-            totalCostUsd: domains.billing.totalCostUsd,
-            calls: domains.billing.calls,
+            rows: domains.rows.length,
           }
         : null,
       pagesTab: pages
         ? {
-            fromCache: pages.billing.fromCache,
-            totalCostUsd: pages.billing.totalCostUsd,
-            calls: pages.billing.calls,
+            rows: pages.rows.length,
           }
         : null,
-      fullyExploredCostUsd: roundUsd(
-        overview.billing.totalCostUsd +
-          (domains?.billing.totalCostUsd ?? 0) +
-          (pages?.billing.totalCostUsd ?? 0),
-      ),
     });
   }
 
@@ -89,6 +111,7 @@ async function main() {
 
 function buildInput(cliArgs: Record<string, string>): BacklinksLookupInput {
   const target = cliArgs.target;
+  const scope = parseScope(cliArgs.scope);
   if (!target) {
     printUsageAndExit("Missing target.");
   }
@@ -98,40 +121,18 @@ function buildInput(cliArgs: Record<string, string>): BacklinksLookupInput {
 
   return {
     target,
-    includeSubdomains: parseBoolean(cliArgs.subdomains, true),
-    includeIndirectLinks: parseBoolean(cliArgs.indirect, true),
-    excludeInternalBacklinks: parseBoolean(cliArgs.excludeInternal, true),
-    status: parseStatus(cliArgs.status),
+    scope,
   };
 }
 
-function parseArgs(argv: string[]) {
-  const parsed: Record<string, string> = {};
-
-  for (let index = 0; index < argv.length; index += 1) {
-    const token = argv[index];
-    if (!token.startsWith("--")) continue;
-
-    const withoutPrefix = token.slice(2);
-    const separatorIndex = withoutPrefix.indexOf("=");
-    if (separatorIndex >= 0) {
-      parsed[withoutPrefix.slice(0, separatorIndex)] = withoutPrefix.slice(
-        separatorIndex + 1,
-      );
-      continue;
-    }
-
-    const next = argv[index + 1];
-    if (!next || next.startsWith("--")) {
-      parsed[withoutPrefix] = "true";
-      continue;
-    }
-
-    parsed[withoutPrefix] = next;
-    index += 1;
-  }
-
-  return parsed;
+function buildBillingCustomer(
+  cliArgs: Record<string, string>,
+): BillingCustomerContext {
+  return {
+    organizationId: cliArgs.organizationId ?? "local",
+    userId: cliArgs.userId ?? "local-user",
+    userEmail: cliArgs.userEmail ?? "local@example.com",
+  };
 }
 
 function parseBoolean(value: string | undefined, fallback: boolean) {
@@ -139,13 +140,15 @@ function parseBoolean(value: string | undefined, fallback: boolean) {
   return value === "true";
 }
 
-function parseStatus(
+function parseScope(
   value: string | undefined,
-): BacklinksLookupInput["status"] {
-  if (value === "live" || value === "lost" || value === "all") {
-    return value;
-  }
-  return "live";
+): BacklinksTargetScope | undefined {
+  if (!value) return undefined;
+  const parsed = backlinksScopeParamSchema.safeParse(value);
+  if (parsed.success) return parsed.data;
+  printUsageAndExit(
+    `Invalid scope: ${value}. Expected domain, subdomains, or exact_url.`,
+  );
 }
 
 function parsePositiveInteger(value: string | undefined, fallback: number) {
@@ -154,34 +157,10 @@ function parsePositiveInteger(value: string | undefined, fallback: number) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-function loadLocalEnv() {
-  for (const path of [".env.local", ".env"]) {
-    if (!existsSync(path)) continue;
-    const content = readFileSync(path, "utf8");
-    for (const line of content.split(/\r?\n/u)) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith("#")) continue;
-
-      const separatorIndex = trimmed.indexOf("=");
-      if (separatorIndex < 0) continue;
-
-      const key = trimmed.slice(0, separatorIndex).trim();
-      const rawValue = trimmed.slice(separatorIndex + 1).trim();
-      if (!key || process.env[key]) continue;
-
-      process.env[key] = rawValue.replace(/^['"]|['"]$/g, "");
-    }
-  }
-}
-
-function roundUsd(value: number) {
-  return Math.round(value * 100000) / 100000;
-}
-
 function printUsageAndExit(message: string): never {
   console.error(message);
   console.error(
-    "Usage: pnpm billing:backlinks --target=example.com --confirmLive=true [--status=live|lost|all] [--subdomains=true|false] [--indirect=true|false] [--excludeInternal=true|false] [--repeat=1] [--includeTabs=true|false] [--allowCi=true]",
+    "Usage: pnpm billing:backlinks --target=example.com --confirmLive=true [--scope=domain|subdomains|exact_url] [--repeat=1] [--includeTabs=true|false] [--allowCi=true]",
   );
   process.exit(1);
 }

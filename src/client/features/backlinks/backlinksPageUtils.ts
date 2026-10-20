@@ -85,16 +85,6 @@ export function formatCompactDate(value: string | null | undefined) {
   });
 }
 
-export function formatFullDate(value: string) {
-  const parsed = new Date(value);
-  if (Number.isNaN(parsed.getTime())) return value;
-  return parsed.toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-    year: "numeric",
-  });
-}
-
 export function formatMonthLabel(value: string) {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return value;
@@ -124,8 +114,15 @@ export function extractUrlPath(url: string) {
   }
 }
 
+const ELLIPSIS = "...";
+
 export function truncateMiddle(value: string, maxLength: number) {
   if (value.length <= maxLength) return value;
-  const sideLength = Math.floor((maxLength - 1) / 2);
-  return `${value.slice(0, sideLength)}...${value.slice(-sideLength)}`;
+  if (maxLength <= ELLIPSIS.length)
+    return value.slice(0, Math.max(maxLength, 0));
+  const sideLength = Math.floor((maxLength - ELLIPSIS.length) / 2);
+  if (sideLength <= 0) {
+    return `${value.slice(0, maxLength - ELLIPSIS.length)}${ELLIPSIS}`;
+  }
+  return `${value.slice(0, sideLength)}${ELLIPSIS}${value.slice(-sideLength)}`;
 }

@@ -1,35 +1,65 @@
-import type { PsiStrategy } from "@/server/lib/audit/types";
+import type { LighthouseStrategy } from "@/server/lib/audit/types";
+import {
+  DEFAULT_AUDIT_PAGES,
+  FREE_MAX_AUDIT_PAGES,
+  MIN_AUDIT_PAGES,
+  PAID_MAX_AUDIT_PAGES,
+} from "@/shared/audit-limits";
 
-export const MAX_USER_AUDIT_USAGE = 100_000;
+export type AuditLimitTier = "free" | "paid" | "self_hosted";
+
+// The crawler runs on our Workers compute and isn't credit-metered, so these
+// per-tier bounds are the abuse control: free accounts cost nothing to create,
+// so they get small audits, a modest burst of concurrent runs, and a modest
+// total budget — the cumulative cap bounds total work, concurrency only bounds
+// the rate. Paid gets bounds sized for real sites rather than abuse (a payment
+// method on file is the deterrent). The cumulative bound is a hosted commercial
+// policy, while the per-audit page limit is also a technical Workflow/database
+// ceiling.
+export const AUDIT_LIMITS: Record<
+  AuditLimitTier,
+  {
+    maxPagesPerAudit: number;
+    maxCapacityUnits: number;
+    maxRunningAudits: number;
+  }
+> = {
+  free: {
+    maxPagesPerAudit: FREE_MAX_AUDIT_PAGES,
+    maxCapacityUnits: 2_000,
+    maxRunningAudits: 5,
+  },
+  paid: {
+    maxPagesPerAudit: PAID_MAX_AUDIT_PAGES,
+    maxCapacityUnits: 100_000,
+    maxRunningAudits: Number.POSITIVE_INFINITY,
+  },
+  self_hosted: {
+    maxPagesPerAudit: PAID_MAX_AUDIT_PAGES,
+    maxCapacityUnits: Number.POSITIVE_INFINITY,
+    maxRunningAudits: Number.POSITIVE_INFINITY,
+  },
+};
 
 export function clampAuditMaxPages(maxPages?: number) {
-  return Math.min(Math.max(maxPages ?? 50, 10), 10_000);
+  return Math.min(
+    Math.max(maxPages ?? DEFAULT_AUDIT_PAGES, MIN_AUDIT_PAGES),
+    PAID_MAX_AUDIT_PAGES,
+  );
 }
 
 export function getEstimatedAuditCapacity(input: {
   maxPages?: number;
-  psiStrategy?: PsiStrategy;
+  lighthouseStrategy?: LighthouseStrategy;
 }) {
   const pagesTotal = clampAuditMaxPages(input.maxPages);
-  const psiStrategy = input.psiStrategy ?? "auto";
-
-  let psiTotal = 0;
-  switch (psiStrategy) {
-    case "all":
-      psiTotal = pagesTotal * 2;
-      break;
-    case "auto":
-      psiTotal = 20;
-      break;
-    case "manual":
-    case "none":
-      psiTotal = 0;
-      break;
-  }
+  const lighthouseStrategy = input.lighthouseStrategy ?? "auto";
+  // "auto" samples up to 10 pages, checked on mobile + desktop.
+  const lighthouseChecks = lighthouseStrategy === "auto" ? 20 : 0;
 
   return {
     pagesTotal,
-    psiTotal,
-    total: pagesTotal + psiTotal,
+    lighthouseTotal: lighthouseChecks,
+    total: pagesTotal + lighthouseChecks,
   };
 }

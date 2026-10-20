@@ -1,42 +1,42 @@
 import { AppError } from "@/server/lib/errors";
+import type { BillingCustomerContext } from "@/server/billing/subscription";
+import type { CreditFeature } from "@/shared/billing-credit-features";
 import {
   CACHE_TTL,
   buildCacheKey,
   getCached,
   setCached,
-} from "@/server/lib/kv-cache";
+} from "@/server/lib/r2-cache";
 import { KeywordResearchRepository } from "@/server/features/keywords/repositories/KeywordResearchRepository";
 import type { KeywordResearchRow } from "@/types/keywords";
-import type { ResearchKeywordsInput } from "@/types/schemas/keywords";
+import type { ResolvedResearchKeywordsInput } from "@/types/schemas/keywords";
 import { z } from "zod";
-import { type EnrichedKeyword, normalizeKeyword } from "./helpers";
-import { fetchResearchRowsBySource } from "./research-data";
+import { getKeywordDataProvider } from "@/shared/keyword-locations";
 import {
-  AUTO_KEYWORD_SOURCES,
+  interleaveRows,
+  normalizeKeyword,
+  type EnrichedKeyword,
+} from "./helpers";
+import {
+  assertLocalResearchLocation,
+  localizeResearchRows,
+} from "./local-volume";
+import {
+  fetchGoogleAdsResearchRows,
+  fetchResearchRowsBySource,
+} from "./research-data";
+import {
   MIN_NON_SEED_FOR_AUTO,
   countNonSeedKeywords,
-  hasSufficientCoverage,
   type KeywordMode,
   type KeywordSource,
+  type ResearchSource,
 } from "./selection";
-
-type SourceAttempt = {
-  source: KeywordSource;
-  rowCount: number;
-  nonSeedCount: number;
-};
-
-type ResearchDiagnostics = {
-  requestedMode: KeywordMode;
-  threshold: number;
-  sourceAttempts: SourceAttempt[];
-};
 
 type ResearchResult = {
   rows: KeywordResearchRow[];
-  source: KeywordSource;
+  source: ResearchSource;
   usedFallback: boolean;
-  diagnostics: ResearchDiagnostics;
 };
 
 type CachedResult = ResearchResult;
@@ -63,134 +63,158 @@ const cachedKeywordRowSchema = z.object({
   ]),
 });
 
-const sourceAttemptSchema = z.object({
-  source: z.enum(["related", "suggestions", "ideas"]),
-  rowCount: z.number(),
-  nonSeedCount: z.number(),
-});
-
 const cachedResultSchema = z.object({
   rows: z.array(cachedKeywordRowSchema),
-  source: z.enum(["related", "suggestions", "ideas"]),
+  source: z.enum(["related", "suggestions", "ideas", "google_ads", "blended"]),
   usedFallback: z.boolean(),
-  diagnostics: z.object({
-    requestedMode: z.enum(["auto", "related", "suggestions", "ideas"]),
-    threshold: z.number(),
-    sourceAttempts: z.array(sourceAttemptSchema),
-  }),
 });
 
-const CACHE_VERSION = 2;
-
-function getMode(input: ResearchKeywordsInput): KeywordMode {
-  return input.mode ?? "auto";
-}
+// v5: auto mode blends suggestions + ideas. v4 (collapsed close variants)
+// only ran in previews; skip it so those entries are never reused.
+const CACHE_VERSION = 5;
 
 async function fetchRowsFromSource(
   source: KeywordSource,
-  input: ResearchKeywordsInput,
+  input: ResolvedResearchKeywordsInput,
   seedKeyword: string,
+  billingCustomer: BillingCustomerContext,
+  opts: { creditFeature?: CreditFeature; resultLimit?: number } = {},
 ): Promise<EnrichedKeyword[]> {
-  return fetchResearchRowsBySource({
-    source,
-    seedKeyword,
-    locationCode: input.locationCode,
-    languageCode: input.languageCode,
-    resultLimit: input.resultLimit,
-  });
+  return fetchResearchRowsBySource(
+    {
+      source,
+      seedKeyword,
+      locationCode: input.locationCode,
+      languageCode: input.languageCode,
+      resultLimit: opts.resultLimit ?? input.resultLimit,
+      includeClickstreamData: input.clickstream,
+      ignoreSynonyms: !input.groupKeywords,
+      creditFeature: opts.creditFeature,
+    },
+    billingCustomer,
+  );
 }
 
+/**
+ * Auto blends phrase-match suggestions with category-level ideas, half the
+ * limit each. Neither works as a sole default: suggestions miss sibling head
+ * terms ("respite care" for "caregiving") and ideas drift toward generic
+ * category terms. The old related-first behavior is worse than both — its
+ * depth-3 "people also search for" graph is tiny for broad seeds and full of
+ * SERP-adjacency noise — so related is only a fallback for obscure seeds
+ * where the blend comes back thin.
+ */
 async function fetchAutoRows(
-  input: ResearchKeywordsInput,
+  input: ResolvedResearchKeywordsInput,
   seedKeyword: string,
+  billingCustomer: BillingCustomerContext,
+  creditFeature?: CreditFeature,
 ): Promise<ResearchResult> {
-  const attempts: SourceAttempt[] = [];
-  let lastSource: KeywordSource = "related";
-  const accumulatedRows: EnrichedKeyword[] = [];
-  const seenKeywords = new Set<string>();
-
-  for (const source of AUTO_KEYWORD_SOURCES) {
-    const rows = await fetchRowsFromSource(source, input, seedKeyword);
-    for (const row of rows) {
-      if (accumulatedRows.length >= input.resultLimit) break;
-      if (seenKeywords.has(row.keyword)) continue;
-      seenKeywords.add(row.keyword);
-      accumulatedRows.push(row);
+  const blendOpts = {
+    creditFeature,
+    resultLimit: Math.ceil(input.resultLimit / 2),
+  };
+  // Settled, not Promise.all: each call meters its own DataForSEO spend, and
+  // workerd cancels in-flight I/O once a response is sent, so throwing while
+  // the sibling call is mid-flight can drop its billing write.
+  const [suggestions, ideas] = await Promise.allSettled([
+    fetchRowsFromSource(
+      "suggestions",
+      input,
+      seedKeyword,
+      billingCustomer,
+      blendOpts,
+    ),
+    fetchRowsFromSource(
+      "ideas",
+      input,
+      seedKeyword,
+      billingCustomer,
+      blendOpts,
+    ),
+  ]);
+  if (suggestions.status === "rejected") {
+    if (ideas.status === "rejected") {
+      console.warn("keywords.research.ideas-leg failed:", ideas.reason);
     }
+    throw suggestions.reason;
+  }
+  if (ideas.status === "rejected") throw ideas.reason;
+  const blended = interleaveRows(
+    suggestions.value,
+    ideas.value,
+    input.resultLimit,
+  );
 
-    attempts.push({
-      source,
-      rowCount: rows.length,
-      nonSeedCount: countNonSeedKeywords(rows, seedKeyword),
-    });
-
-    lastSource = source;
-
-    if (
-      hasSufficientCoverage(accumulatedRows, seedKeyword, MIN_NON_SEED_FOR_AUTO)
-    ) {
-      return {
-        rows: accumulatedRows,
-        source,
-        usedFallback: source !== AUTO_KEYWORD_SOURCES[0],
-        diagnostics: {
-          requestedMode: "auto",
-          threshold: MIN_NON_SEED_FOR_AUTO,
-          sourceAttempts: attempts,
-        },
-      };
-    }
+  if (countNonSeedKeywords(blended, seedKeyword) >= MIN_NON_SEED_FOR_AUTO) {
+    return { rows: blended, source: "blended", usedFallback: false };
   }
 
-  return {
-    rows: accumulatedRows,
-    source: lastSource,
-    usedFallback: true,
-    diagnostics: {
-      requestedMode: "auto",
-      threshold: MIN_NON_SEED_FOR_AUTO,
-      sourceAttempts: attempts,
+  const related = await fetchRowsFromSource(
+    "related",
+    input,
+    seedKeyword,
+    billingCustomer,
+    {
+      creditFeature,
     },
+  );
+
+  return {
+    rows: interleaveRows(blended, related, input.resultLimit),
+    source: "blended",
+    usedFallback: true,
   };
+}
+
+async function fetchGoogleAdsRows(
+  input: ResolvedResearchKeywordsInput,
+  seedKeyword: string,
+  billingCustomer: BillingCustomerContext,
+  creditFeature?: CreditFeature,
+): Promise<ResearchResult> {
+  const rows = await fetchGoogleAdsResearchRows(
+    {
+      seedKeyword,
+      locationCode: input.locationCode,
+      languageCode: input.languageCode,
+      resultLimit: input.resultLimit,
+      creditFeature,
+    },
+    billingCustomer,
+  );
+
+  return { rows, source: "google_ads", usedFallback: false };
 }
 
 async function fetchManualRows(
   mode: Exclude<KeywordMode, "auto">,
-  input: ResearchKeywordsInput,
+  input: ResolvedResearchKeywordsInput,
   seedKeyword: string,
+  billingCustomer: BillingCustomerContext,
+  creditFeature?: CreditFeature,
 ): Promise<ResearchResult> {
-  const rows = await fetchRowsFromSource(mode, input, seedKeyword);
-  const attempt: SourceAttempt = {
-    source: mode,
-    rowCount: rows.length,
-    nonSeedCount: countNonSeedKeywords(rows, seedKeyword),
-  };
-
-  return {
-    rows,
-    source: mode,
-    usedFallback: false,
-    diagnostics: {
-      requestedMode: mode,
-      threshold: MIN_NON_SEED_FOR_AUTO,
-      sourceAttempts: [attempt],
+  const rows = await fetchRowsFromSource(
+    mode,
+    input,
+    seedKeyword,
+    billingCustomer,
+    {
+      creditFeature,
     },
-  };
+  );
+  return { rows, source: mode, usedFallback: false };
 }
 
-function isUsableCachedResult(cached: CachedResult): boolean {
-  if (cached.rows.length === 0) return false;
-
-  return true;
-}
-
-function buildResearchCacheKey(
-  input: ResearchKeywordsInput,
+async function buildResearchCacheKey(
+  input: ResolvedResearchKeywordsInput,
   normalizedKeywords: string[],
   mode: KeywordMode,
-): string {
+  billingCustomer: BillingCustomerContext,
+): Promise<string> {
   return buildCacheKey("kw:research", {
     cacheVersion: CACHE_VERSION,
+    organizationId: billingCustomer.organizationId,
     projectId: input.projectId,
     keywords: normalizedKeywords,
     locationCode: input.locationCode,
@@ -198,11 +222,17 @@ function buildResearchCacheKey(
     resultLimit: input.resultLimit,
     mode,
     depth: 3,
+    clickstream: input.clickstream,
+    groupKeywords: input.groupKeywords,
+    locationName: input.locationName,
   });
 }
 
-function persistRows(input: ResearchKeywordsInput, rows: EnrichedKeyword[]) {
-  void Promise.all(
+function persistRows(
+  input: ResolvedResearchKeywordsInput,
+  rows: EnrichedKeyword[],
+): Promise<void> {
+  return Promise.all(
     rows.map((row) =>
       KeywordResearchRepository.upsertKeywordMetric({
         projectId: input.projectId,
@@ -217,23 +247,19 @@ function persistRows(input: ResearchKeywordsInput, rows: EnrichedKeyword[]) {
         monthlySearchesJson: JSON.stringify(row.trend),
       }),
     ),
-  ).catch((error) => {
-    console.error("keywords.research.persist-metrics failed:", error);
-  });
+  ).then(
+    () => undefined,
+    (error: unknown) => {
+      console.error("keywords.research.persist-metrics failed:", error);
+    },
+  );
 }
 
 export async function research(
-  userId: string,
-  input: ResearchKeywordsInput,
+  input: ResolvedResearchKeywordsInput,
+  billingCustomer: BillingCustomerContext,
+  creditFeature?: CreditFeature,
 ): Promise<ResearchResult> {
-  const project = await KeywordResearchRepository.getProject(
-    input.projectId,
-    userId,
-  );
-  if (!project) {
-    throw new AppError("NOT_FOUND");
-  }
-
   const uniqueKeywords = [
     ...new Set(input.keywords.map(normalizeKeyword)),
   ].filter((keyword) => keyword.length > 0);
@@ -243,8 +269,24 @@ export async function research(
   }
 
   const seedKeyword = uniqueKeywords[0];
-  const mode = getMode(input);
-  const cacheKey = buildResearchCacheKey(input, uniqueKeywords, mode);
+  const provider = getKeywordDataProvider(input.locationCode);
+  // Labs source modes, clickstream, and synonym filtering don't exist for
+  // Google-Ads-served countries; normalize them so equivalent requests share
+  // one cache entry. Local volume replaces the clickstream volume, so a local
+  // request never pays for clickstream.
+  const effectiveInput: ResolvedResearchKeywordsInput =
+    provider === "google_ads"
+      ? { ...input, mode: "auto", clickstream: false, groupKeywords: false }
+      : input.locationName
+        ? { ...input, clickstream: false }
+        : input;
+  const mode = effectiveInput.mode ?? "auto";
+  const cacheKey = await buildResearchCacheKey(
+    effectiveInput,
+    uniqueKeywords,
+    mode,
+    billingCustomer,
+  );
 
   const cachedRaw = await getCached(cacheKey);
   const cachedResult = cachedResultSchema.safeParse(cachedRaw);
@@ -252,17 +294,80 @@ export async function research(
     ? cachedResult.data
     : null;
 
-  if (cached && isUsableCachedResult(cached)) {
+  if (cached && cached.rows.length > 0) {
     return cached;
   }
 
-  const result =
-    mode === "auto"
-      ? await fetchAutoRows(input, seedKeyword)
-      : await fetchManualRows(mode, input, seedKeyword);
+  const result = effectiveInput.locationName
+    ? await researchLocal(
+        effectiveInput,
+        effectiveInput.locationName,
+        billingCustomer,
+        creditFeature,
+      )
+    : provider === "google_ads"
+      ? await fetchGoogleAdsRows(
+          effectiveInput,
+          seedKeyword,
+          billingCustomer,
+          creditFeature,
+        )
+      : mode === "auto"
+        ? await fetchAutoRows(
+            effectiveInput,
+            seedKeyword,
+            billingCustomer,
+            creditFeature,
+          )
+        : await fetchManualRows(
+            mode,
+            effectiveInput,
+            seedKeyword,
+            billingCustomer,
+            creditFeature,
+          );
 
   await setCached(cacheKey, result, CACHE_TTL.researchResult);
-  persistRows(input, result.rows);
+  // Keyword metrics are stored per country, so local rows are not persisted.
+  if (!effectiveInput.locationName)
+    void persistRows(effectiveInput, result.rows);
 
   return result;
+}
+
+/**
+ * Keyword ideas, difficulty, and intent come from the national research
+ * (cached and persisted as usual). One Google Ads call then replaces volume,
+ * CPC, and competition with numbers for the city, county, or region.
+ */
+async function researchLocal(
+  input: ResolvedResearchKeywordsInput,
+  locationName: string,
+  billingCustomer: BillingCustomerContext,
+  creditFeature?: CreditFeature,
+): Promise<ResearchResult> {
+  await assertLocalResearchLocation(input.locationCode, locationName);
+  const nationalInput = { ...input, locationName: undefined };
+  const national = await research(
+    nationalInput,
+    billingCustomer,
+    creditFeature,
+  );
+  // A save from local results sends no metrics, so the saved keyword relies on
+  // the stored national ones. Store them before returning, also when the
+  // national result came from the cache.
+  await persistRows(nationalInput, national.rows);
+  return {
+    ...national,
+    rows: await localizeResearchRows(
+      national.rows,
+      {
+        locationCode: input.locationCode,
+        locationName,
+        languageCode: input.languageCode,
+        creditFeature,
+      },
+      billingCustomer,
+    ),
+  };
 }

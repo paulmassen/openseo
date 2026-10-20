@@ -1,8 +1,8 @@
 import { loader } from "fumadocs-core/source";
-// Keep this deep import for now: the public "fumadocs-mdx/runtime/vite" entry
-// resolves to the browser runtime in our SSR build, which breaks sourceAsync.
-import { fromConfig } from "../../node_modules/fumadocs-mdx/dist/runtime/vite/server.js";
-import { blog } from "../../source.generated";
+// Keep this server runtime import explicit. In this app's SSR build, the
+// public Vite runtime entry resolves to the browser variant for sourceAsync.
+import { fromConfig } from "fumadocs-mdx/runtime/vite.server";
+import { blog, docs, docsMeta } from "../../.source/index";
 import type * as Config from "../../source.config";
 
 const serverCreate = fromConfig<typeof Config>();
@@ -12,4 +12,24 @@ export const blogSource = loader({
   baseUrl: "/blogs",
 });
 
-export { blog };
+export const docsSource = loader({
+  source: await serverCreate.sourceAsync(docs, docsMeta),
+  baseUrl: "/docs",
+  plugins: [
+    {
+      transformPageTree: {
+        folder(node, folderPath) {
+          // Folders whose meta.json lists an explicit "[Overview](...)" link;
+          // drop the index node so the folder title doesn't duplicate it.
+          if (folderPath !== "skills" && folderPath !== "self-hosting")
+            return node;
+
+          return {
+            ...node,
+            index: undefined,
+          };
+        },
+      },
+    },
+  ],
+});

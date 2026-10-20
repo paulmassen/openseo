@@ -4,6 +4,7 @@ export class AppError extends Error {
   constructor(
     public readonly code: ErrorCode,
     message?: string,
+    public readonly details?: Record<string, string>,
   ) {
     super(message ?? code);
     this.name = "AppError";
@@ -18,10 +19,9 @@ export function asAppError(error: unknown): AppError | null {
   return null;
 }
 
-function toErrorCode(error: unknown): ErrorCode {
-  return asAppError(error)?.code ?? "INTERNAL_ERROR";
-}
-
+// The client only ever receives the bare code. Server messages can carry
+// internal detail, so the client maps each code to its own copy and the full
+// message stays in the server logs.
 export function toClientError(error: unknown): Error {
-  return new Error(toErrorCode(error));
+  return new Error(asAppError(error)?.code ?? "INTERNAL_ERROR");
 }

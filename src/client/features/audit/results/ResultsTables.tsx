@@ -1,201 +1,247 @@
-import { ChevronDown, Download, ExternalLink } from "lucide-react";
+import { useMemo, useState, type ReactNode } from "react";
+import {
+  createColumnHelper,
+  type ColumnDef,
+  type SortingState,
+} from "@tanstack/react-table";
+import { Link } from "@tanstack/react-router";
+import { Badge } from "@/client/components/ui/badge";
+import { Button } from "@/client/components/ui/button";
+import { DataTable, useDataTable } from "@/client/components/table/DataTable";
+import { SortableHeader } from "@/client/components/table/SortableHeader";
 import {
   extractPathname,
-  HttpStatusBadge,
-  PsiScoreBadge,
+  LighthouseScoreBadge,
 } from "@/client/features/audit/shared";
 import type { AuditResultsData } from "@/client/features/audit/results/types";
+import {
+  countActiveFilters,
+  PerformanceFilterBar,
+  ResultsTableToolbar,
+} from "@/client/features/audit/results/AuditResultsTableFilters";
+import {
+  EMPTY_PERFORMANCE_FILTERS,
+  filterPerformanceRows,
+  isLighthouseFailure,
+  nullableNumberSort,
+  nullableStringSort,
+  type PerformanceFilters,
+  type PerformanceRowData,
+} from "@/client/features/audit/results/AuditResultsTableFilterLogic";
 
-export function PagesTable({ pages }: { pages: AuditResultsData["pages"] }) {
-  return (
-    <div className="overflow-x-auto">
-      <table className="table table-sm">
-        <thead>
-          <tr>
-            <th>URL</th>
-            <th>Status</th>
-            <th>Title</th>
-            <th>H1</th>
-            <th>Words</th>
-            <th>Images</th>
-            <th>Speed</th>
-          </tr>
-        </thead>
-        <tbody>
-          {pages.map((page) => (
-            <tr key={page.id}>
-              <td className="max-w-[200px] truncate">
-                <a
-                  href={page.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="link link-primary text-xs inline-flex items-center gap-1"
-                >
-                  {extractPathname(page.url)}
-                  <ExternalLink className="size-3" />
-                </a>
-              </td>
-              <td>
-                <HttpStatusBadge code={page.statusCode} />
-              </td>
-              <td className="max-w-[180px] truncate" title={page.title ?? ""}>
-                {page.title || (
-                  <span className="text-error text-xs">missing</span>
-                )}
-              </td>
-              <td>{page.h1Count}</td>
-              <td>{page.wordCount}</td>
-              <td>
-                {page.imagesMissingAlt > 0 ? (
-                  <span className="text-warning">
-                    {page.imagesMissingAlt}/{page.imagesTotal}
-                  </span>
-                ) : (
-                  page.imagesTotal
-                )}
-              </td>
-              <td className="text-xs">
-                {page.responseTimeMs ? `${page.responseTimeMs}ms` : "-"}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
+const performanceColumnHelper = createColumnHelper<PerformanceRowData>();
 
 export function PerformanceTable({
+  auditId,
   projectId,
-  psi,
+  lighthouse,
   pages,
+  tabs,
 }: {
+  auditId: string;
   projectId: string;
-  psi: AuditResultsData["psi"];
+  lighthouse: AuditResultsData["lighthouse"];
   pages: AuditResultsData["pages"];
+  tabs: ReactNode;
 }) {
+  const [filters, setFilters] = useState<PerformanceFilters>(
+    EMPTY_PERFORMANCE_FILTERS,
+  );
+  const [showFilters, setShowFilters] = useState(false);
+  const [sorting, setSorting] = useState<SortingState>([
+    { id: "performanceScore", desc: false },
+  ]);
+  const rows = useMemo(
+    () =>
+      lighthouse.map((result) => {
+        const page = pages.find((candidate) => candidate.id === result.pageId);
+        const pageUrl = page?.url ?? null;
+        return {
+          ...result,
+          pageUrl,
+          pagePath: pageUrl ? extractPathname(pageUrl) : null,
+        };
+      }),
+    [lighthouse, pages],
+  );
+  const filteredRows = useMemo(
+    () => filterPerformanceRows(rows, filters),
+    [filters, rows],
+  );
+  const activeFilterCount = countActiveFilters(
+    filters,
+    EMPTY_PERFORMANCE_FILTERS,
+  );
+  const columns = useMemo(
+    () => buildPerformanceColumns({ auditId, projectId }),
+    [auditId, projectId],
+  );
+  const table = useDataTable({
+    data: filteredRows,
+    columns,
+    state: { sorting },
+    onSortingChange: setSorting,
+    withSorting: true,
+  });
+
+  const resetFilters = () => setFilters(EMPTY_PERFORMANCE_FILTERS);
+
   return (
-    <div className="overflow-x-auto">
-      <table className="table table-sm">
-        <thead>
-          <tr>
-            <th>URL</th>
-            <th>Device</th>
-            <th>Status</th>
-            <th>Perf</th>
-            <th>A11y</th>
-            <th>SEO</th>
-            <th>LCP</th>
-            <th>CLS</th>
-            <th>INP</th>
-            <th>TTFB</th>
-            <th>Issues</th>
-          </tr>
-        </thead>
-        <tbody>
-          {psi.map((result) => (
-            <PerformanceRow
-              key={result.id}
-              projectId={projectId}
-              result={result}
-              page={pages.find((candidate) => candidate.id === result.pageId)}
+    <DataTable
+      table={table}
+      empty={{ title: "No Lighthouse results" }}
+      isFiltered={activeFilterCount > 0}
+      onClearFilters={resetFilters}
+      toolbar={
+        <>
+          {tabs}
+          <ResultsTableToolbar
+            showFilters={showFilters}
+            onToggle={() => setShowFilters((current) => !current)}
+            activeFilterCount={activeFilterCount}
+            resultCount={filteredRows.length}
+            totalCount={rows.length}
+          />
+          {showFilters ? (
+            <PerformanceFilterBar
+              filters={filters}
+              onChange={setFilters}
+              activeFilterCount={activeFilterCount}
+              onReset={resetFilters}
             />
-          ))}
-        </tbody>
-      </table>
-    </div>
+          ) : null}
+        </>
+      }
+    />
   );
 }
 
-function PerformanceRow({
+function buildPerformanceColumns({
+  auditId,
   projectId,
-  result,
-  page,
 }: {
+  auditId: string;
   projectId: string;
-  result: AuditResultsData["psi"][number];
-  page: AuditResultsData["pages"][number] | undefined;
-}) {
-  const isFailed = !!result.errorMessage;
-
-  return (
-    <tr>
-      <td className="max-w-[160px] truncate text-xs">
-        {page ? extractPathname(page.url) : "-"}
-      </td>
-      <td className="capitalize text-xs">{result.strategy}</td>
-      <td>
-        {isFailed ? (
-          <span
-            className="badge badge-error badge-outline text-xs"
-            title={result.errorMessage ?? "PSI check failed"}
-          >
+}): ColumnDef<PerformanceRowData>[] {
+  return [
+    performanceColumnHelper.accessor("pagePath", {
+      header: ({ column }) => <SortableHeader column={column} label="URL" />,
+      cell: ({ getValue }) => (
+        <span className="text-xs">{getValue() ?? "-"}</span>
+      ),
+      sortingFn: nullableStringSort,
+      meta: { cellClassName: "max-w-[180px] truncate" },
+    }),
+    performanceColumnHelper.accessor("strategy", {
+      header: ({ column }) => <SortableHeader column={column} label="Device" />,
+      cell: ({ getValue }) => (
+        <span className="capitalize text-xs">{getValue()}</span>
+      ),
+    }),
+    performanceColumnHelper.display({
+      id: "status",
+      header: ({ column }) => <SortableHeader column={column} label="Status" />,
+      cell: ({ row }) => {
+        const isFailed = isLighthouseFailure(row.original);
+        const failureMessage =
+          row.original.errorMessage ?? "Lighthouse returned no category scores";
+        return isFailed ? (
+          <Badge variant="destructive" title={failureMessage}>
             failed
-          </span>
+          </Badge>
         ) : (
-          <span className="badge badge-success badge-outline text-xs">ok</span>
-        )}
-      </td>
-      <td>
-        <PsiScoreBadge score={result.performanceScore} />
-      </td>
-      <td>
-        <PsiScoreBadge score={result.accessibilityScore} />
-      </td>
-      <td>
-        <PsiScoreBadge score={result.seoScore} />
-      </td>
-      <td className="text-xs">
-        {result.lcpMs ? `${(result.lcpMs / 1000).toFixed(1)}s` : "-"}
-      </td>
-      <td className="text-xs">
-        {result.cls != null ? result.cls.toFixed(3) : "-"}
-      </td>
-      <td className="text-xs">
-        {result.inpMs ? `${Math.round(result.inpMs)}ms` : "-"}
-      </td>
-      <td className="text-xs">
-        {result.ttfbMs ? `${Math.round(result.ttfbMs)}ms` : "-"}
-      </td>
-      <td>
-        {result.r2Key ? (
-          <a
-            className="btn btn-primary btn-xs"
-            href={`/p/${projectId}/audit/issues/${result.id}?source=site&category=performance`}
+          <Badge variant="success">ok</Badge>
+        );
+      },
+      enableSorting: true,
+      sortingFn: (left, right) =>
+        Number(isLighthouseFailure(left.original)) -
+        Number(isLighthouseFailure(right.original)),
+    }),
+    performanceColumnHelper.accessor("performanceScore", {
+      header: ({ column }) => <SortableHeader column={column} label="Perf" />,
+      cell: ({ getValue }) => <LighthouseScoreBadge score={getValue()} />,
+      sortingFn: nullableNumberSort,
+    }),
+    performanceColumnHelper.accessor("accessibilityScore", {
+      header: ({ column }) => <SortableHeader column={column} label="A11y" />,
+      cell: ({ getValue }) => <LighthouseScoreBadge score={getValue()} />,
+      sortingFn: nullableNumberSort,
+    }),
+    performanceColumnHelper.accessor("seoScore", {
+      header: ({ column }) => <SortableHeader column={column} label="SEO" />,
+      cell: ({ getValue }) => <LighthouseScoreBadge score={getValue()} />,
+      sortingFn: nullableNumberSort,
+    }),
+    performanceColumnHelper.accessor("lcpMs", {
+      header: ({ column }) => <SortableHeader column={column} label="LCP" />,
+      cell: ({ getValue }) => {
+        const value = getValue();
+        return value ? (
+          <span className="text-xs">{(value / 1000).toFixed(1)}s</span>
+        ) : (
+          <span className="text-xs text-muted-foreground">-</span>
+        );
+      },
+      sortingFn: nullableNumberSort,
+    }),
+    performanceColumnHelper.accessor("cls", {
+      header: ({ column }) => <SortableHeader column={column} label="CLS" />,
+      cell: ({ getValue }) => {
+        const value = getValue();
+        return value != null ? (
+          <span className="text-xs">{value.toFixed(3)}</span>
+        ) : (
+          <span className="text-xs text-muted-foreground">-</span>
+        );
+      },
+      sortingFn: nullableNumberSort,
+    }),
+    performanceColumnHelper.accessor("inpMs", {
+      header: ({ column }) => <SortableHeader column={column} label="INP" />,
+      cell: ({ getValue }) => {
+        const value = getValue();
+        return value ? (
+          <span className="text-xs">{Math.round(value)}ms</span>
+        ) : (
+          <span className="text-xs text-muted-foreground">-</span>
+        );
+      },
+      sortingFn: nullableNumberSort,
+    }),
+    performanceColumnHelper.accessor("ttfbMs", {
+      header: ({ column }) => <SortableHeader column={column} label="TTFB" />,
+      cell: ({ getValue }) => {
+        const value = getValue();
+        return value ? (
+          <span className="text-xs">{Math.round(value)}ms</span>
+        ) : (
+          <span className="text-xs text-muted-foreground">-</span>
+        );
+      },
+      sortingFn: nullableNumberSort,
+    }),
+    performanceColumnHelper.display({
+      id: "issues",
+      header: () => "Issues",
+      cell: ({ row }) =>
+        row.original.r2Key && !isLighthouseFailure(row.original) ? (
+          <Button
+            size="xs"
+            nativeButton={false}
+            render={
+              <Link
+                to="/p/$projectId/audit/issues/$resultId"
+                params={{ projectId, resultId: row.original.id }}
+                search={{ auditId, category: "performance" }}
+              />
+            }
           >
             View issues
-          </a>
+          </Button>
         ) : (
-          <span className="text-xs text-base-content/40">-</span>
-        )}
-      </td>
-    </tr>
-  );
-}
-
-export function ExportDropdown({
-  onExport,
-}: {
-  onExport: (format: "csv" | "json") => void;
-}) {
-  return (
-    <div className="dropdown dropdown-end">
-      <div tabIndex={0} role="button" className="btn btn-sm btn-ghost gap-1">
-        <Download className="size-4" />
-        Export
-        <ChevronDown className="size-3 opacity-60" />
-      </div>
-      <ul
-        tabIndex={0}
-        className="dropdown-content z-10 menu p-2 shadow-lg bg-base-100 border border-base-300 rounded-box w-40"
-      >
-        <li>
-          <button onClick={() => onExport("csv")}>CSV</button>
-        </li>
-        <li>
-          <button onClick={() => onExport("json")}>JSON</button>
-        </li>
-      </ul>
-    </div>
-  );
+          <span className="text-xs text-muted-foreground">-</span>
+        ),
+    }),
+  ];
 }

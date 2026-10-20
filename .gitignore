@@ -4,6 +4,7 @@ package-lock.json
 yarn.lock
 .dev.vars
 dist/
+dist-sourcemaps/
 .wrangler
 /tmp
 
@@ -12,8 +13,12 @@ dist/
 .DS_Store
 .cache
 .env
-.env.local
-.env.production
+.env.
+.env.*
+!.env.example
+!.env.preview.example
+!.env.production.example
+!.env.selfhost.example
 .vercel
 .output
 .nitro
@@ -29,3 +34,14 @@ dist/
 .tanstack
 .logs/
 **/.pnpm-store/
+
+# Localflare generated files
+.localflare/
+
+# Local Claude config (skills are shared)
+.claude/*
+!.claude/skills/
+!.claude/CLAUDE.md
+
+# Alchemy local state + bundle artifacts (SaaS deploys)
+.alchemy/

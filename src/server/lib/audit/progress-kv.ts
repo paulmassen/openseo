@@ -14,52 +14,27 @@ import { jsonCodec } from "@/shared/json";
 const KV_PREFIX = "audit-progress:";
 const TTL_SECONDS = 30 * 60; // 30 minutes
 const MAX_ENTRIES = 300;
-const jsonUnknownCodec = jsonCodec(z.unknown());
 
-interface CrawledUrlEntry {
-  url: string;
-  statusCode: number;
-  title: string;
+const crawledUrlEntrySchema = z.object({
+  url: z.string(),
+  statusCode: z.number(),
+  title: z.string(),
   /** Unix timestamp ms when this page was crawled */
-  crawledAt: number;
-}
+  crawledAt: z.number(),
+});
 
-function isCrawledUrlEntry(value: unknown): value is CrawledUrlEntry {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as {
-    url?: unknown;
-    statusCode?: unknown;
-    title?: unknown;
-    crawledAt?: unknown;
-  };
-  return (
-    typeof candidate.url === "string" &&
-    typeof candidate.statusCode === "number" &&
-    typeof candidate.title === "string" &&
-    typeof candidate.crawledAt === "number"
-  );
-}
+type CrawledUrlEntry = z.infer<typeof crawledUrlEntrySchema>;
+
+const crawledEntriesCodec = jsonCodec(z.array(crawledUrlEntrySchema));
 
 function parseCrawledEntries(json: string | null): CrawledUrlEntry[] {
   if (!json) return [];
-  const parsed = jsonUnknownCodec.safeParse(json);
-  if (!parsed.success || !Array.isArray(parsed.data)) return [];
-  return parsed.data.filter(isCrawledUrlEntry);
+  const parsed = crawledEntriesCodec.safeParse(json);
+  return parsed.success ? parsed.data : [];
 }
 
 function key(auditId: string): string {
   return `${KV_PREFIX}${auditId}`;
-}
-
-/**
- * Append a crawled URL entry to the progress list.
- * Newest entries are prepended so the array is sorted newest-first.
- */
-async function pushCrawledUrl(
-  auditId: string,
-  entry: CrawledUrlEntry,
-): Promise<void> {
-  await pushCrawledUrls(auditId, [entry]);
 }
 
 /**
@@ -99,7 +74,6 @@ async function clear(auditId: string): Promise<void> {
 }
 
 export const AuditProgressKV = {
-  pushCrawledUrl,
   pushCrawledUrls,
   getCrawledUrls,
   clear,
